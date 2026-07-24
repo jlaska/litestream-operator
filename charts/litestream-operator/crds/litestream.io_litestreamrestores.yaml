@@ -55,6 +55,13 @@ spec:
             description: LitestreamRestoreSpec defines the desired state of a LitestreamRestore
               operation.
             properties:
+              force:
+                description: |-
+                  Force causes the restore Job to pass -force to litestream, overwriting an
+                  existing database file at TargetPath. By default, litestream refuses to
+                  overwrite a non-empty file. Set this to true only when you intentionally
+                  want to replace an existing database (e.g. recovering from a diverged DB).
+                type: boolean
               image:
                 description: |-
                   Image overrides the Litestream container image used for the restore Job.

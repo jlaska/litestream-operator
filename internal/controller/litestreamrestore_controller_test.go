@@ -1902,7 +1902,6 @@ var _ = Describe("LitestreamRestore State Machine with StatefulSet target", func
 	})
 })
 
-
 // simulateValidationSuccess marks the validation Job as complete (integrity check passed).
 func simulateValidationSuccess(ctx context.Context, restoreKey types.NamespacedName) {
 	validateJobKey := types.NamespacedName{Name: restoreKey.Name + "-validate", Namespace: restoreKey.Namespace}
