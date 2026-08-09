@@ -2,7 +2,7 @@ name: Dependabot Auto-Merge
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, synchronize, reopened]
   pull_request_review:
     types: [submitted]
 
@@ -12,22 +12,40 @@ permissions:
 
 jobs:
   dependabot-auto-merge:
-    runs-on: ubuntu-latest
     if: github.event.pull_request.user.login == 'dependabot[bot]'
-    steps:
-    - name: Dependabot metadata
-      id: metadata
-      uses: dependabot/fetch-metadata@v3
-      with:
-        github-token: "${{ secrets.GITHUB_TOKEN }}"
+    runs-on: ubuntu-latest
 
-    - name: Auto-merge Dependabot PRs
-      if: >-
-        steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
-        steps.metadata.outputs.update-type == 'version-update:semver-minor' ||
-        (steps.metadata.outputs.update-type == 'version-update:semver-major' &&
-         github.event.review.state == 'approved')
-      run: gh pr merge --auto --squash "$PR_URL"
-      env:
-        PR_URL: ${{github.event.pull_request.html_url}}
-        GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v3
+        with:
+          github-token: ${{ github.token }}
+
+      - name: Approve patch and minor updates
+        if: |
+          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr review "$PR_URL" --approve
+
+      - name: Merge patch and minor updates
+        if: |
+          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge "$PR_URL" --admin --squash
+
+      - name: Merge approved major updates
+        if: |
+          steps.metadata.outputs.update-type == 'version-update:semver-major' &&
+          github.event_name == 'pull_request_review' &&
+          github.event.review.state == 'approved'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge "$PR_URL" --admin --squash
