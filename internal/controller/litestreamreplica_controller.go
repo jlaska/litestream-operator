@@ -710,25 +710,26 @@ func (r *LitestreamReplicaReconciler) handleReplicaFinalization(ctx context.Cont
 // injected containers. A change in any of these fields triggers a rollout.
 func injectionSpecHash(db *databasev1.LitestreamReplica) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "image=%s\n", db.Spec.Image)
-	fmt.Fprintf(h, "recovery.mode=%s\n", db.Spec.Recovery.Mode)
-	fmt.Fprintf(h, "databaseName=%s\n", db.Spec.DatabaseName)
-	fmt.Fprintf(h, "databasePath=%s\n", db.Spec.DatabasePath)
-	fmt.Fprintf(h, "backup.enabled=%t\n", db.Spec.Backup.Enabled)
+	w := func(s string) { _, _ = io.WriteString(h, s) }
+	w(fmt.Sprintf("image=%s\n", db.Spec.Image))
+	w(fmt.Sprintf("recovery.mode=%s\n", db.Spec.Recovery.Mode))
+	w(fmt.Sprintf("databaseName=%s\n", db.Spec.DatabaseName))
+	w(fmt.Sprintf("databasePath=%s\n", db.Spec.DatabasePath))
+	w(fmt.Sprintf("backup.enabled=%t\n", db.Spec.Backup.Enabled))
 	if db.Spec.Backup.Destination.S3 != nil {
-		fmt.Fprintf(h, "s3.endpoint=%s\n", db.Spec.Backup.Destination.S3.Endpoint)
-		fmt.Fprintf(h, "s3.bucket=%s\n", db.Spec.Backup.Destination.S3.Bucket)
-		fmt.Fprintf(h, "s3.path=%s\n", db.Spec.Backup.Destination.S3.Path)
-		fmt.Fprintf(h, "s3.secretRef=%s\n", db.Spec.Backup.Destination.S3.SecretRef)
+		w(fmt.Sprintf("s3.endpoint=%s\n", db.Spec.Backup.Destination.S3.Endpoint))
+		w(fmt.Sprintf("s3.bucket=%s\n", db.Spec.Backup.Destination.S3.Bucket))
+		w(fmt.Sprintf("s3.path=%s\n", db.Spec.Backup.Destination.S3.Path))
+		w(fmt.Sprintf("s3.secretRef=%s\n", db.Spec.Backup.Destination.S3.SecretRef))
 	}
-	fmt.Fprintf(h, "backup.logLevel=%s\n", db.Spec.Backup.LogLevel)
-	fmt.Fprintf(h, "backup.syncInterval=%s\n", db.Spec.Backup.SyncInterval)
-	fmt.Fprintf(h, "bootstrap.sql=%s\n", db.Spec.Bootstrap.SQL)
+	w(fmt.Sprintf("backup.logLevel=%s\n", db.Spec.Backup.LogLevel))
+	w(fmt.Sprintf("backup.syncInterval=%s\n", db.Spec.Backup.SyncInterval))
+	w(fmt.Sprintf("bootstrap.sql=%s\n", db.Spec.Bootstrap.SQL))
 	if db.Spec.RunAsUser != nil {
-		fmt.Fprintf(h, "runAsUser=%d\n", *db.Spec.RunAsUser)
+		w(fmt.Sprintf("runAsUser=%d\n", *db.Spec.RunAsUser))
 	}
 	if db.Spec.RunAsGroup != nil {
-		fmt.Fprintf(h, "runAsGroup=%d\n", *db.Spec.RunAsGroup)
+		w(fmt.Sprintf("runAsGroup=%d\n", *db.Spec.RunAsGroup))
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))[:16]
 }
