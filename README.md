@@ -1,9 +1,9 @@
 # litestream-operator
 
 [![Tests](https://github.com/jlaska/litestream-operator/actions/workflows/test.yml/badge.svg)](https://github.com/jlaska/litestream-operator/actions/workflows/test.yml)
+[![Lint](https://raw.githubusercontent.com/jlaska/litestream-operator/badges/.badges/main/lint.svg)](https://github.com/jlaska/litestream-operator/actions/workflows/test.yml)
+[![Coverage](https://raw.githubusercontent.com/jlaska/litestream-operator/badges/.badges/main/coverage.svg)](https://github.com/jlaska/litestream-operator/actions/workflows/test.yml)
 [![CI/CD Pipeline](https://github.com/jlaska/litestream-operator/actions/workflows/ci.yaml/badge.svg)](https://github.com/jlaska/litestream-operator/actions/workflows/ci.yaml)
-[![lint](https://raw.githubusercontent.com/jlaska/litestream-operator/badges/.badges/main/lint.svg)](https://github.com/jlaska/litestream-operator/actions/workflows/test.yml)
-[![coverage](https://raw.githubusercontent.com/jlaska/litestream-operator/badges/.badges/main/coverage.svg)](https://github.com/jlaska/litestream-operator/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Container Image](https://img.shields.io/badge/container-ghcr.io-blue)](https://github.com/jlaska/litestream-operator/pkgs/container/litestream-operator)
 
