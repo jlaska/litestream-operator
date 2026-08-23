@@ -1,239 +1,137 @@
-# Build and CI/CD Setup Guide
-
-This guide covers setting up the build pipeline and CI/CD for the Litestream Operator with Quay.io integration.
+# Build and Development Guide
 
 ## Prerequisites
 
-1. **Quay.io Account**: Create an account at [quay.io](https://quay.io)
-2. **GitHub Repository**: Push your code to GitHub
-3. **Container Registry**: Create a repository at `quay.io/jlaska/litestream-operator`
+- Go 1.22+
+- Docker (or Podman)
+- [Kind](https://kind.sigs.k8s.io/) (for integration testing)
+- Helm 3
+- kubectl
 
-## Quay.io Setup
+## Local Development
 
-### 1. Create Repository
-
-1. Go to [quay.io](https://quay.io)
-2. Click "Create New Repository"
-3. Name: `litestream-operator`
-4. Visibility: Public (or Private if preferred)
-5. Click "Create Public Repository"
-
-### 2. Generate Robot Account (Recommended)
-
-1. Go to your repository settings
-2. Click "Robot Accounts"
-3. Create a new robot account with "Write" permissions
-4. Note the username (e.g., `jlaska+sqlite_operator_bot`) and token
-
-### 3. Alternative: Use Personal Credentials
-
-You can use your personal Quay.io username and password, but robot accounts are more secure.
-
-## GitHub Actions Setup
-
-### 1. Add Secrets to GitHub Repository
-
-Go to your GitHub repository → Settings → Secrets and variables → Actions
-
-Add these secrets:
-
-```
-QUAY_USERNAME=jlaska+sqlite_operator_bot  # Your robot account username
-QUAY_PASSWORD=<robot-account-token>       # Your robot account token
-```
-
-Or if using personal credentials:
-```
-QUAY_USERNAME=jlaska              # Your Quay.io username
-QUAY_PASSWORD=<your-password>     # Your Quay.io password
-```
-
-### 2. Repository Settings
-
-Ensure these settings are enabled:
-- Actions → General → Allow all actions and reusable workflows
-- Actions → General → Allow GitHub Actions to create and approve pull requests
-
-## Local Development Workflow
-
-### Building Locally
+### Build and test
 
 ```bash
-# Build and test locally
-make ci-build
+# Build the operator binary
+make build
 
-# Build for specific version
-make docker-build IMG=quay.io/jlaska/litestream-operator:v0.1.0
+# Run unit tests (uses envtest — no cluster required)
+make test
 
-# Push to registry
-make docker-push IMG=quay.io/jlaska/litestream-operator:v0.1.0
+# Lint
+make lint
 
-# Generate release manifests
-make ci-deploy-manifests IMG=quay.io/jlaska/litestream-operator:v0.1.0
+# Generate CRDs and manifests
+make generate && make manifests
+
+# Format
+make fmt && make vet
 ```
 
-### Version Management
+### Run against a local cluster
+
+```bash
+# Build container image
+make docker-build
+
+# Load into Kind and deploy
+kind create cluster --name litestream-dev
+kind load docker-image ghcr.io/jlaska/litestream-operator:v0.4.2 --name litestream-dev
+helm install litestream-operator charts/litestream-operator \
+  --namespace litestream-operator-system \
+  --create-namespace \
+  --set image.pullPolicy=Never
+```
+
+### Integration tests
+
+Integration tests use Kind with an in-cluster MinIO (or external S3) backend:
+
+```bash
+# Full integration test suite (creates a Kind cluster, deploys operator, runs tests)
+make kind-test-integration
+
+# Rebuild and redeploy into existing cluster, then run tests
+make test-integration-redeploy
+```
+
+## Container Image
+
+The container image is published to `ghcr.io/jlaska/litestream-operator`.
+
+```bash
+# Build
+make docker-build
+
+# Push (requires authentication to ghcr.io)
+make docker-push
+
+# Build with specific version
+make docker-build IMG=ghcr.io/jlaska/litestream-operator:v0.5.0
+```
+
+## Version Management
+
+Versions are managed in `Makefile.versions`:
 
 ```bash
 # Check current version
 make version
 
 # Bump versions
-make version-bump-patch  # v0.1.0 → v0.1.1
-make version-bump-minor  # v0.1.0 → v0.2.0
-make version-bump-major  # v0.1.0 → v1.0.0
-
-# Build with new version
-make docker-build
-make docker-push
+make version-bump-patch  # v0.4.2 → v0.4.3
+make version-bump-minor  # v0.4.2 → v0.5.0
+make version-bump-major  # v0.4.2 → v1.0.0
 ```
 
-### Multi-Architecture Builds
+## CI/CD Pipeline
+
+GitHub Actions runs on:
+- **Push to main**: Builds and runs tests
+- **Pull requests**: Runs tests and linting
+- **Push tags (v*)**: Builds, pushes container image, creates GitHub release
+
+### GitHub Secrets required
+
+| Secret | Description |
+|---|---|
+| `GITHUB_TOKEN` | Automatically provided; used for GHCR push and release creation |
+
+### Pipeline stages
+
+1. **Lint**: golangci-lint
+2. **Test**: Unit tests with envtest
+3. **Build**: Container image build and push to GHCR
+4. **Release** (tags only): GitHub release with Helm chart
+
+## Creating a Release
 
 ```bash
-# Build for multiple architectures
-make docker-build-multiarch IMG=quay.io/jlaska/litestream-operator:v0.1.0
-```
-
-## CI/CD Pipeline Workflow
-
-### Automatic Triggers
-
-The pipeline runs on:
-- **Push to main/develop**: Builds and pushes `latest` tag
-- **Push tags (v*)**: Builds, pushes versioned image, creates GitHub release
-- **Pull Requests**: Runs tests and security scans
-
-### Pipeline Stages
-
-1. **Test**: Runs Go tests and linting
-2. **Build**: Builds multi-arch container image and pushes to Quay
-3. **Security Scan**: Scans image with Trivy for vulnerabilities
-4. **Generate Manifests**: Creates deployment YAML files
-5. **Release** (tags only): Creates GitHub release with manifests
-
-### Manual Releases
-
-To create a release:
-
-```bash
-# Bump version and commit
+# Bump version
 make version-bump-minor
 git add Makefile.versions
-git commit -m "bump: version to v0.2.0"
+git commit -m "bump: version to v0.5.0"
 
 # Create and push tag
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.5.0
+git push origin v0.5.0
 ```
 
-This will trigger the full pipeline and create a GitHub release.
+This triggers the CI pipeline to build the image, push to GHCR, and create a GitHub release.
 
-## Deployment Options
+## Project Structure
 
-### Option 1: Direct kubectl
-
-```bash
-# Deploy operator
-kubectl apply -f https://github.com/jlaska/litestream-operator/releases/latest/download/litestream-operator.yaml
-
-# Deploy samples
-kubectl apply -f https://github.com/jlaska/litestream-operator/releases/latest/download/samples.yaml
 ```
-
-### Option 2: Kustomize
-
-```bash
-# Clone and deploy
-git clone https://github.com/jlaska/litestream-operator.git
-cd litestream-operator
-kubectl apply -k deploy/
-kubectl apply -k deploy/samples/
+├── api/v1/                    # CRD type definitions
+├── charts/litestream-operator/ # Helm chart
+├── cmd/main.go                # Operator entrypoint
+├── config/                    # Kustomize bases (CRDs, RBAC, webhooks)
+├── internal/
+│   ├── controller/            # Reconcilers for LitestreamReplica and LitestreamRestore
+│   └── webhook/               # Mutating (sidecar injection) and validating webhooks
+├── test/integration/          # Integration tests (Kind + S3)
+├── docs/                      # Documentation
+├── Makefile                   # Build targets
+└── Makefile.versions          # Version and registry configuration
 ```
-
-### Option 3: ArgoCD
-
-Create an ArgoCD Application:
-
-```yaml
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: litestream-operator
-  namespace: argocd
-spec:
-  project: default
-  source:
-    repoURL: https://github.com/jlaska/litestream-operator.git
-    targetRevision: HEAD
-    path: deploy
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: litestream-operator-system
-  syncPolicy:
-    automated: {}
-    syncOptions:
-    - CreateNamespace=true
-```
-
-## Monitoring Build Status
-
-### GitHub Actions
-- View workflow runs at: `https://github.com/jlaska/litestream-operator/actions`
-
-### Quay.io
-- View builds at: `https://quay.io/repository/jlaska/litestream-operator`
-- Check tags and security scans
-
-### Releases
-- View releases at: `https://github.com/jlaska/litestream-operator/releases`
-
-## Troubleshooting
-
-### Build Failures
-
-```bash
-# Check workflow logs in GitHub Actions
-# Common issues:
-# 1. Invalid Quay credentials
-# 2. Repository permissions
-# 3. Docker build errors
-
-# Test locally:
-make ci-build
-```
-
-### Image Pull Issues
-
-```bash
-# Verify image exists
-docker pull quay.io/jlaska/litestream-operator:latest
-
-# Check repository visibility
-# Ensure Quay repository is public or credentials are configured
-```
-
-### Deployment Issues
-
-```bash
-# Check operator logs
-kubectl logs -n litestream-operator-system deployment/litestream-operator-controller-manager
-
-# Verify image reference in deployment
-kubectl get deployment -n litestream-operator-system -o yaml | grep image
-```
-
-## Security Best Practices
-
-1. **Use Robot Accounts**: More secure than personal credentials
-2. **Limit Permissions**: Robot accounts should only have necessary permissions
-3. **Regular Updates**: Keep dependencies updated via Dependabot
-4. **Vulnerability Scanning**: Pipeline includes Trivy security scanning
-5. **Signed Images**: Consider enabling image signing with cosign
-
-## Next Steps
-
-1. **Push to GitHub**: Commit and push your changes
-2. **Verify Pipeline**: Check that GitHub Actions runs successfully
-3. **Test Deployment**: Deploy to a test cluster
-4. **Production Deployment**: Use ArgoCD or your preferred GitOps tool

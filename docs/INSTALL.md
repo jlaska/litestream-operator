@@ -1,192 +1,114 @@
-# Litestream Operator Deployment
+# Litestream Operator Installation
 
-This directory contains Kubernetes manifests for deploying the Litestream Operator using Kustomize.
+## Prerequisites
 
-## Directory Structure
+- Kubernetes >= 1.28
+- Helm 3
+- [cert-manager](https://cert-manager.io/) installed in the cluster (or bring your own webhook TLS secret)
 
-```
-deploy/
-├── kustomization.yaml              # Main kustomization file
-├── namespace.yaml                  # Operator namespace
-├── serviceaccount.yaml            # Service account for operator
-├── clusterrole.yaml               # RBAC permissions
-├── clusterrolebinding.yaml        # Bind permissions to service account
-├── deployment.yaml                # Operator deployment
-├── service.yaml                   # Metrics service
-├── controller_manager_config.yaml # Controller configuration
-├── litestream.io_litestreamreplicas.yaml # LitestreamReplica CRD
-└── samples/
-    ├── kustomization.yaml         # Sample resources kustomization
-    └── sample-litestreamreplica.yaml       # Example LitestreamReplica resource
-```
-
-## Quick Deployment
-
-### 1. Deploy the Operator
+## Install with Helm
 
 ```bash
-# Deploy the operator and CRD
-kubectl apply -k deploy/
+helm install litestream-operator oci://ghcr.io/jlaska/charts/litestream-operator \
+  --version 0.4.1 \
+  --namespace litestream-operator-system \
+  --create-namespace
+```
 
-# Verify the operator is running
+### Without cert-manager
+
+If you manage your own TLS certificates for webhooks:
+
+```bash
+helm install litestream-operator oci://ghcr.io/jlaska/charts/litestream-operator \
+  --version 0.4.1 \
+  --namespace litestream-operator-system \
+  --create-namespace \
+  --set certManager.enabled=false \
+  --set certManager.secretName=my-tls-secret
+```
+
+The TLS secret must contain `tls.crt` and `tls.key` entries signed by a CA that the API server trusts for webhook traffic.
+
+## Verify the installation
+
+```bash
+# Check the operator is running
 kubectl get pods -n litestream-operator-system
+# NAME                                                    READY   STATUS    RESTARTS   AGE
+# litestream-operator-controller-manager-xxxxx-xxxxx      1/1     Running   0          30s
+
+# Check CRDs are installed
+kubectl get crd | grep litestream
+# litestreamreplicas.litestream.io    2026-01-01T00:00:00Z
+# litestreamrestores.litestream.io    2026-01-01T00:00:00Z
+
+# Check webhooks are registered
+kubectl get validatingwebhookconfigurations | grep litestream
+kubectl get mutatingwebhookconfigurations | grep litestream
 ```
 
-### 2. Create a SQLite Database
+## Helm chart values
 
 ```bash
-# Deploy a sample SQLite database
-kubectl apply -k deploy/samples/
-
-# Check the status
-kubectl get litestreamreplica
-kubectl describe litestreamreplica example-sqlite
+helm show values oci://ghcr.io/jlaska/charts/litestream-operator --version 0.4.1
 ```
 
-### 3. Verify the Database is Running
+Key values:
+
+| Value | Default | Description |
+|---|---|---|
+| `image.repository` | `ghcr.io/jlaska/litestream-operator` | Operator image |
+| `image.tag` | chart `appVersion` | Image tag |
+| `replicaCount` | `1` | Operator replicas |
+| `webhook.enabled` | `true` | Enable mutating/validating webhooks |
+| `webhook.failurePolicy` | `Fail` | Webhook failure policy |
+| `certManager.enabled` | `true` | Use cert-manager for webhook TLS |
+| `certManager.secretName` | `litestream-operator-webhook-cert` | TLS secret name |
+| `litestream.defaultImage` | `litestream/litestream:0.5.14` | Default Litestream sidecar image |
+
+## Upgrade
 
 ```bash
-# Check the created resources
-kubectl get pods,svc,pvc -l app=example-sqlite
-
-# Connect to the database (optional)
-kubectl exec -it deployment/example-sqlite -- sqlite3 /data/myapp.db ".schema"
+helm upgrade litestream-operator oci://ghcr.io/jlaska/charts/litestream-operator \
+  --version <new-version> \
+  --namespace litestream-operator-system
 ```
 
-## Customization
+CRD updates are included in the chart. After upgrading, verify existing `LitestreamReplica` resources reconcile correctly:
 
-### Building Custom Images
+```bash
+kubectl get litestreamreplica -A
+```
+
+## Uninstall
+
+```bash
+helm uninstall litestream-operator --namespace litestream-operator-system
+```
+
+This removes the operator but leaves CRDs and existing `LitestreamReplica`/`LitestreamRestore` resources in place. To remove CRDs (this deletes all custom resources):
+
+```bash
+kubectl delete crd litestreamreplicas.litestream.io litestreamrestores.litestream.io
+```
+
+## Development deployment
+
+For local development against a Kind or minikube cluster:
 
 ```bash
 # Build the operator image
-make docker-build IMG=your-registry/litestream-operator:v1.0.0
+make docker-build
 
-# Push to registry
-make docker-push IMG=your-registry/litestream-operator:v1.0.0
+# Load into Kind
+kind load docker-image ghcr.io/jlaska/litestream-operator:latest
+
+# Install with Helm using local image
+helm install litestream-operator charts/litestream-operator \
+  --namespace litestream-operator-system \
+  --create-namespace \
+  --set image.pullPolicy=Never
 ```
 
-### Using Custom Images
-
-Edit `deploy/kustomization.yaml` to use your custom image:
-
-```yaml
-images:
-- name: controller
-  newName: your-registry/litestream-operator
-  newTag: v1.0.0
-```
-
-### Creating Custom LitestreamReplica Resources
-
-Example LitestreamReplica resource:
-
-```yaml
-apiVersion: litestream.io/v1
-kind: LitestreamReplica
-metadata:
-  name: my-database
-  namespace: my-namespace
-spec:
-  databaseName: "app_db"
-  storage:
-    size: "5Gi"
-  replicas: 1
-  initSQL: |
-    CREATE TABLE products (
-      id INTEGER PRIMARY KEY,
-      name TEXT NOT NULL,
-      price REAL
-    );
-    INSERT INTO products (name, price) VALUES ('Widget', 9.99);
-  backupEnabled: true
-  backupSchedule: "0 2 * * *"
-```
-
-## LitestreamReplica Spec Fields
-
-| Field | Type | Description | Required |
-|-------|------|-------------|----------|
-| `databaseName` | string | Name of the SQLite database file | Yes |
-| `storage.size` | string | Size of persistent storage (default: 1Gi) | No |
-| `storage.storageClass` | string | Storage class name for the database | No |
-| `replicas` | int32 | Number of replicas (default: 1) | No |
-| `initSQL` | string | SQL statements to run during initialization | No |
-| `backupEnabled` | bool | Enable automatic backups | No |
-| `backupSchedule` | string | Backup schedule in cron format | No |
-
-## LitestreamReplica Status Fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `phase` | string | Current phase (Creating, Pending, Ready) |
-| `ready` | bool | Whether the database is ready |
-| `databaseSize` | string | Current database file size |
-| `lastBackup` | metav1.Time | Timestamp of last backup |
-| `podName` | string | Name of the pod running the database |
-| `conditions` | []metav1.Condition | Detailed status conditions |
-
-## Monitoring
-
-The operator exposes metrics on port 8443. You can scrape these metrics using Prometheus:
-
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: litestream-operator-metrics
-  namespace: litestream-operator-system
-spec:
-  ports:
-  - name: https
-    port: 8443
-    targetPort: https
-  selector:
-    control-plane: controller-manager
-```
-
-## Troubleshooting
-
-### Check Operator Logs
-
-```bash
-kubectl logs -n litestream-operator-system deployment/litestream-operator-controller-manager -c manager
-```
-
-### Check LitestreamReplica Events
-
-```bash
-kubectl describe litestreamreplica <name>
-```
-
-### Check Created Resources
-
-```bash
-kubectl get all -l app=<litestreamreplica-name>
-```
-
-## ArgoCD Integration
-
-This operator works well with ArgoCD. Create an Application pointing to the `deploy/` directory:
-
-```yaml
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: litestream-operator
-  namespace: argocd
-spec:
-  project: default
-  source:
-    repoURL: https://your-repo/litestream-operator.git
-    targetRevision: HEAD
-    path: deploy
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: litestream-operator-system
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-    syncOptions:
-    - CreateNamespace=true
-```
+See [BUILD.md](./BUILD.md) for full development instructions.

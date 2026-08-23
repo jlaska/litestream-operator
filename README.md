@@ -9,7 +9,7 @@
 
 > **Continuous S3 backup for SQLite databases running in Kubernetes** — no application changes required.
 
-litestream-operator injects a [Litestream](https://litestream.io) sidecar into your existing application pods, streaming WAL changes to any S3-compatible object store (MinIO, AWS S3, Backblaze B2, …) in real time. Declare a `LitestreamReplica` resource, point it at your app's Deployment, and get point-in-time-recoverable database backups without touching your application code.
+litestream-operator injects a [Litestream](https://litestream.io) sidecar into your existing application pods, streaming WAL changes to any S3-compatible object store (MinIO, AWS S3, Backblaze B2, ...) in real time. Declare a `LitestreamReplica` resource, point it at your app's Deployment, and get point-in-time-recoverable database backups without touching your application code.
 
 ---
 
@@ -24,7 +24,7 @@ helm install litestream-operator oci://ghcr.io/jlaska/charts/litestream-operator
   --create-namespace
 ```
 
-> **Prerequisites**: Kubernetes ≥ 1.28, Helm 3, [cert-manager](https://cert-manager.io/) installed in the cluster.
+> **Prerequisites**: Kubernetes >= 1.28, Helm 3, [cert-manager](https://cert-manager.io/) installed in the cluster.
 >
 > To skip cert-manager (bring your own webhook TLS secret):
 > ```bash
@@ -54,14 +54,15 @@ metadata:
   name: paperless-db
   namespace: paperless
 spec:
-  # The existing Deployment that owns the database file.
   targetDeployment: paperless-webserver
-
-  # Where the database file lives inside the app container.
   databasePath: /usr/src/paperless/data
   databaseName: paperless.db
 
-  # Backup configuration — streams WAL changes continuously to S3.
+  # Recovery mode: Manual (default) blocks startup if local DB missing but
+  # archive exists; Automatic uses Litestream's native restore flags.
+  recovery:
+    mode: Automatic
+
   backup:
     enabled: true
     destination:
@@ -71,7 +72,11 @@ spec:
         path: paperless/
         secretRef: minio-creds
     retention:
-      duration: "720h"              # 30 days (Litestream 0.5.x duration-based retention)
+      duration: "720h"              # 30 days
+
+  # Backup health SLO — mark ReplicationHealthy=False if no sync within 5m.
+  health:
+    maxReplicationLag: 5m
 ```
 
 Apply it:
@@ -87,15 +92,16 @@ The operator annotates `paperless-webserver`, which triggers a rolling update. N
 ```bash
 # Check injection and backup health
 kubectl get litestreamreplica paperless-db -n paperless
-
-# NAME           TARGET                DATABASE       BACKUP  PHASE  READY
-# paperless-db   paperless-webserver   paperless.db   true    Ready  true
+# NAME           TARGET                DATABASE       BACKUP  PHASE  READY  AGE
+# paperless-db   paperless-webserver   paperless.db   true    Ready  true   3d
 
 kubectl describe litestreamreplica paperless-db -n paperless
 # Conditions:
-#   SidecarInjected  True   Annotated
-#   BackupHealthy    True   SidecarRunning
-#   Ready            True   DeploymentReady
+#   TargetReady          True   DeploymentFound
+#   SidecarReady         True   SidecarRunning
+#   ReplicationHealthy   True   ReplicationWithinThreshold
+#   RecoverySafe         True   ArchiveConsistent
+#   Ready                True   AllConditionsMet
 ```
 
 ---
@@ -129,8 +135,8 @@ litestream-operator is to SQLite what [CloudNativePG](https://cloudnative-pg.io)
 1. You create a `LitestreamReplica` CR pointing at an existing Deployment
 2. The controller annotates the Deployment's pod template (`litestream.io/inject: "true"`)
 3. The annotation triggers a rolling update — new pods inherit the label
-4. The mutating webhook intercepts pod creation and injects the Litestream sidecar
-5. Litestream streams WAL changes to S3 continuously; the operator monitors sidecar health
+4. The mutating webhook intercepts pod creation and injects the Litestream sidecar, plus init containers for recovery and bootstrap
+5. Litestream streams WAL changes to S3 continuously; the operator monitors replication health via Litestream metrics
 
 ---
 
@@ -140,27 +146,53 @@ litestream-operator is to SQLite what [CloudNativePG](https://cloudnative-pg.io)
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `spec.targetDeployment` | string | ✓ | Name of the existing Deployment to inject into |
-| `spec.databasePath` | string | ✓ | Directory path inside the app container (e.g. `/data`) |
-| `spec.databaseName` | string | ✓ | Filename of the SQLite database (e.g. `app.db`) |
+| `spec.targetDeployment` | string | * | Name of the Deployment to inject into (mutually exclusive with `targetStatefulSet`) |
+| `spec.targetStatefulSet` | string | * | Name of the StatefulSet to inject into (mutually exclusive with `targetDeployment`) |
+| `spec.databasePath` | string | yes | Directory path inside the app container (e.g. `/data`) |
+| `spec.databaseName` | string | yes | Filename of the SQLite database (e.g. `app.db`) |
+| `spec.container` | string | | Application container name. Defaults to the first container. Set when the database volume is mounted in a non-first container |
 | `spec.image` | string | | Litestream image override (default: `litestream/litestream:0.5.14`) |
+| `spec.recovery.mode` | `Manual` \| `Automatic` | | Recovery strategy on pod startup (default: `Manual`) |
 | `spec.backup.enabled` | bool | | Enable Litestream replication (default: `false`) |
-| `spec.backup.destination.s3.endpoint` | string | | S3-compatible endpoint URL (e.g. `minio.homelab:9000`); omit for AWS S3 |
-| `spec.backup.destination.s3.bucket` | string | ✓ (when enabled) | S3 bucket name |
+| `spec.backup.destination.s3.endpoint` | string | | S3-compatible endpoint URL; omit for AWS S3 |
+| `spec.backup.destination.s3.bucket` | string | when enabled | S3 bucket name |
 | `spec.backup.destination.s3.path` | string | | Key prefix within the bucket |
-| `spec.backup.destination.s3.secretRef` | string | ✓ (when enabled) | Secret containing `ACCESS_KEY_ID` and `SECRET_ACCESS_KEY` |
-| `spec.backup.retention.duration` | string | | How long to retain backups as a duration string (default: `"720h"`) |
-| `spec.initSQL` | string | | SQL statements applied once on first use (idempotent via content hash) |
-| `spec.initImage` | string | | Init container image for applying `initSQL` (default: `keinos/sqlite3:latest`) |
+| `spec.backup.destination.s3.secretRef` | string | when enabled | Secret containing `ACCESS_KEY_ID` and `SECRET_ACCESS_KEY` |
+| `spec.backup.retention.duration` | string | | Backup retention as a Go duration string (default: `"720h"`) |
+| `spec.backup.syncInterval` | string | | Litestream sync interval override (e.g. `"1s"`, `"500ms"`) |
+| `spec.backup.logLevel` | string | | Litestream log level: `debug`, `info`, `warn`, `error` |
+| `spec.backup.resources` | ResourceRequirements | | Compute resources for the Litestream sidecar container |
+| `spec.health.maxReplicationLag` | string | | Maximum acceptable replication lag (e.g. `"5m"`). Sets `ReplicationHealthy` condition |
+| `spec.bootstrap.sql` | string | | SQL executed only when the database is genuinely new (no local DB and no remote archive) |
+| `spec.bootstrap.image` | string | | Image for bootstrap init container (default: `keinos/sqlite3:latest`) |
+| `spec.runAsUser` | int64 | | UID for Litestream init containers |
+| `spec.runAsGroup` | int64 | | GID for Litestream init containers |
 
 **Status conditions:**
 
 | Condition | Meaning |
 |---|---|
-| `SidecarInjected` | Litestream sidecar annotation applied to target Deployment |
-| `BackupHealthy` | Litestream sidecar is running in ≥1 pod |
-| `InitSQLApplied` | `initSQL` ConfigMap is ready (SQL will be applied on next pod start) |
-| `Ready` | Target Deployment has ready replicas |
+| `TargetReady` | Target workload exists and is valid |
+| `SidecarReady` | Litestream sidecar is injected and running |
+| `ReplicationHealthy` | Replication lag is within `maxReplicationLag` threshold |
+| `RecoverySafe` | No archive mismatch detected at startup |
+| `BootstrapApplied` | Bootstrap SQL configured and init container ready |
+| `ReplicationPaused` | Replication intentionally paused (e.g. during restore) |
+| `ReplicaCountExceeded` | Workload has more than one replica (unsafe for SQLite) |
+| `UnsafeRolloutStrategy` | Deployment rollout strategy can create concurrent writers |
+| `Ready` | Top-level readiness (all safety conditions met) |
+
+**Status fields:**
+
+| Field | Description |
+|---|---|
+| `status.phase` | Lifecycle state: `Configuring`, `Pending`, `Ready`, `Paused`, `Error` |
+| `status.ready` | Quick readiness flag for `kubectl get` |
+| `status.backupHealthy` | Last replication health check result |
+| `status.lastSuccessfulReplicationTime` | Timestamp of most recent successful sync |
+| `status.replicationLag` | Duration since last successful sync (human-readable) |
+| `status.injectedSpecHash` | Hash of injection-relevant spec fields on the target workload |
+| `status.observedGeneration` | `.metadata.generation` this status was computed from |
 
 ```bash
 kubectl get litestreamreplica -A
@@ -170,7 +202,9 @@ kubectl get litestreamreplica -A
 
 ### LitestreamRestore
 
-Trigger a point-in-time restore from any `LitestreamReplica` backup:
+Trigger a restore from any `LitestreamReplica` backup. Two modes:
+
+**InPlace** (default) — fences the application, restores in place, resumes:
 
 ```yaml
 apiVersion: litestream.io/v1
@@ -179,50 +213,127 @@ metadata:
   name: paperless-restore
   namespace: paperless
 spec:
-  sourceRef: paperless-db         # which LitestreamReplica's backup to restore from
-  targetPVC: paperless-restore    # PVC to write the restored database into
-  targetPath: /data/paperless.db  # full path including filename
+  sourceRef:
+    name: paperless-db
+  mode: InPlace
   timestamp: "2026-06-17T10:00:00Z"  # optional: point-in-time recovery
 ```
 
-The operator creates a Kubernetes Job that runs `litestream restore`. Monitor progress:
+**ToPVC** — restores to a separate PVC without touching the source application (for recovery testing, forensic inspection, migration, or cloning):
+
+```yaml
+apiVersion: litestream.io/v1
+kind: LitestreamRestore
+metadata:
+  name: paperless-clone
+  namespace: paperless
+spec:
+  sourceRef:
+    name: paperless-db
+  mode: ToPVC
+  target:
+    pvc: paperless-restore
+    path: /data/paperless.db
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `spec.sourceRef.name` | string | yes | Name of the LitestreamReplica whose backup to restore from |
+| `spec.mode` | `InPlace` \| `ToPVC` | | Restore strategy (default: `InPlace`) |
+| `spec.target.pvc` | string | ToPVC | PVC to write the restored database into |
+| `spec.target.path` | string | ToPVC | Full path including filename for the restored database |
+| `spec.timestamp` | string | | RFC 3339 timestamp for point-in-time recovery |
+| `spec.image` | string | | Litestream image override for the restore Job |
+| `spec.force` | bool | | Pass `-force` to litestream, overwriting existing database file |
+| `spec.runAsUser` | int64 | | UID for the restore Job pod |
+| `spec.runAsGroup` | int64 | | GID for the restore Job pod |
+
+**Restore phases:** `Pending` -> `AcquiringLock` -> `Fencing` -> `Restoring` -> `Validating` -> `Resuming` -> `Completed` (or `Failed`)
+
+**Restore conditions:**
+
+| Condition | Meaning |
+|---|---|
+| `Locked` | Restore has acquired its concurrency lock (one active InPlace restore per source) |
+| `ApplicationFenced` | Source application scaled to zero and replication paused |
+| `RestoreSucceeded` | Restore Job completed successfully |
+| `ApplicationResumed` | Source application scaled back up |
+
+Monitor progress:
 
 ```bash
 kubectl get litestreamrestore paperless-restore -n paperless
-# NAME                SOURCE         TARGETPVC           PHASE     AGE
-# paperless-restore   paperless-db   paperless-restore   Complete  2m
+# NAME                SOURCE         MODE      PHASE      AGE
+# paperless-restore   paperless-db   InPlace   Completed  2m
 ```
+
+---
+
+## Recovery modes
+
+### Manual (default)
+
+If local state is missing or inconsistent with the remote archive, block workload startup and require an explicit `LitestreamRestore`. This is the safety-first default — a missing database with an existing archive will never silently start fresh.
+
+```yaml
+spec:
+  recovery:
+    mode: Manual
+```
+
+### Automatic
+
+Uses upstream Litestream's native restore with idempotent flags (`-if-db-not-exists`, `-if-replica-exists`) and integrity checking (`-integrity-check quick`). Any genuine restore failure blocks pod startup — the operator never converts a restore error into a fresh database.
+
+```yaml
+spec:
+  recovery:
+    mode: Automatic
+```
+
+---
+
+## Production checklist
+
+- [ ] **Single replica**: Set `replicas: 1` on the target Deployment/StatefulSet
+- [ ] **Safe rollout strategy**: Use `Recreate` or `RollingUpdate` with `maxSurge: 0` to prevent concurrent SQLite writers
+- [ ] **ReadWriteOncePod PVC**: Use `ReadWriteOncePod` access mode where your CSI driver supports it (stronger than `ReadWriteOnce`)
+- [ ] **Backup health monitoring**: Set `spec.health.maxReplicationLag` and alert on `ReplicationHealthy=False`
+- [ ] **Tested restore**: Regularly test restores with `mode: ToPVC` to verify backup integrity without downtime
+- [ ] **S3 durability**: Use a durable object store with versioning enabled
+- [ ] **Resource requests**: Set `spec.backup.resources` on the Litestream sidecar
+- [ ] **PodDisruptionBudget**: Consider a PDB for the target workload
 
 ---
 
 ## Usage examples
 
-### Idempotent schema initialization
+### Bootstrap SQL for new databases
 
-Use `initSQL` to seed the database schema on first use. The operator tracks a SHA-256 hash of the content — the SQL is applied once and re-applied when the content changes (useful for additive schema migrations):
+Use `spec.bootstrap.sql` to seed the database schema on genuinely new databases. Unlike `initSQL` (removed), this runs only when no local database file exists AND no remote archive is available:
 
 ```yaml
 spec:
-  initSQL: |
-    CREATE TABLE IF NOT EXISTS users (
-      id    INTEGER PRIMARY KEY AUTOINCREMENT,
-      name  TEXT NOT NULL,
-      email TEXT NOT NULL UNIQUE
-    );
-    CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+  bootstrap:
+    sql: |
+      CREATE TABLE IF NOT EXISTS users (
+        id    INTEGER PRIMARY KEY AUTOINCREMENT,
+        name  TEXT NOT NULL,
+        email TEXT NOT NULL UNIQUE
+      );
+      CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 ```
 
-### Disable backup (injection only)
+### Multi-container Deployments
 
-Deploy Litestream without enabling backup — useful for testing injection, or when backup is handled externally:
+When the database volume is mounted in a non-first container, use `spec.container`:
 
 ```yaml
 spec:
   targetDeployment: my-app
+  container: database-writer    # select the container with the DB volume
   databasePath: /data
   databaseName: app.db
-  backup:
-    enabled: false
 ```
 
 ### AWS S3 (no custom endpoint)
@@ -240,20 +351,144 @@ spec:
         secretRef: aws-creds
 ```
 
-### Override the Litestream image
+### Disable backup (injection only)
+
+Deploy Litestream without enabling backup — useful for testing injection:
 
 ```yaml
 spec:
-  image: litestream/litestream:0.5.14
+  targetDeployment: my-app
+  databasePath: /data
+  databaseName: app.db
+  backup:
+    enabled: false
 ```
+
+---
+
+## Annotations
+
+The operator uses these annotations on target workloads:
+
+| Annotation | Description |
+|---|---|
+| `litestream.io/inject` | Signals the mutating webhook to inject the Litestream sidecar |
+| `litestream.io/config` | References the LitestreamReplica CR (`namespace/name`) that configures injection |
+| `litestream.io/injection-spec-hash` | Deterministic hash of injection-relevant config; changes trigger rollouts |
+| `litestream.io/pause` | When `"true"` on a CR, pauses replication without killing the sidecar |
+| `litestream.io/skip-archive-check` | When `"true"` on a CR, disables the archive-check init container |
+
+---
+
+## Kubernetes events
+
+The operator emits events for operationally important transitions:
+
+| Event | Type | Description |
+|---|---|---|
+| `ReplicaCountExceeded` | Warning | Target workload has more than one replica |
+| `UnsafeRolloutStrategy` | Warning | Deployment uses RollingUpdate with maxSurge > 0 |
+| `ReplicationHealthy` | Normal | Replication health check passed |
+| `ReplicationUnhealthy` | Warning | Replication lag exceeded threshold |
+| `ReplicaDeinstrumented` | Normal | Injection annotations removed on CR deletion |
+| `RestoreStarted` | Normal | Restore fencing or Job creation started |
+| `PausingReplication` | Normal | Replication paused before restore |
+| `ApplicationFenced` | Normal | Workload scaled to zero for restore |
+| `RestoreComplete` | Normal | Restore Job finished successfully |
+| `ApplicationResumed` | Normal | Workload scaled back up after restore |
+| `RestoreFailed` | Warning | Restore Job or operation failed |
+| `DeletedMidRestore` | Warning | Restore CR deleted while in-progress |
+
+---
+
+## Prometheus metrics
+
+The injected Litestream sidecar exposes metrics on port 9090. The webhook automatically sets Prometheus discovery annotations on the pod:
+
+```
+prometheus.io/scrape: "true"
+prometheus.io/port: "9090"
+prometheus.io/path: "/metrics"
+```
+
+Existing Prometheus annotations on the pod are preserved (not overwritten).
+
+**Recommended alerts:**
+
+- Replication lag exceeds threshold (`ReplicationHealthy=False`)
+- No successful sync within threshold
+- Archive unreachable
+- `LitestreamReplica` not Ready
+- Restore failed / application fenced
+
+---
+
+## Troubleshooting
+
+### Startup blocked (Manual recovery mode)
+
+**Symptom**: Pod stuck in init, `RecoverySafe=False`.
+
+**Cause**: Local database is missing but a remote archive exists. Manual mode requires explicit recovery.
+
+**Fix**: Create a `LitestreamRestore` with `mode: InPlace` to restore from the archive.
+
+### UnsafeRolloutStrategy condition
+
+**Symptom**: `UnsafeRolloutStrategy=True`, `Ready=False`.
+
+**Cause**: The target Deployment uses `RollingUpdate` with `maxSurge > 0`, which can temporarily run two pods and corrupt the SQLite database.
+
+**Fix**: Change the rollout strategy:
+```yaml
+strategy:
+  type: Recreate
+```
+or:
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 0
+    maxUnavailable: 1
+```
+
+### ReplicationHealthy=False
+
+**Symptom**: Backup appears unhealthy despite Litestream sidecar running.
+
+**Cause**: Replication lag exceeds `spec.health.maxReplicationLag` threshold, or S3 credentials are invalid, or the object store is unreachable.
+
+**Fix**: Check Litestream sidecar logs, verify S3 credentials, and confirm network connectivity to the object store.
+
+### Restore stuck in Fencing phase
+
+**Symptom**: `LitestreamRestore` phase is `Fencing` and not progressing.
+
+**Cause**: The restore controller couldn't scale the workload to zero or pause replication.
+
+**Fix**: Check operator logs. If the workload has a PDB preventing scale-down, temporarily relax it.
+
+### Restore failure leaves application fenced
+
+**By design**: If a restore fails after fencing the application, the workload remains at `replicas=0`. This prevents starting against unverified data.
+
+**Fix**: Investigate the restore Job logs, fix the issue, and create a new `LitestreamRestore`. Or manually scale the workload back up if you've verified the database state.
+
+### CR deletion leaves stale annotations
+
+**Symptom**: After deleting a `LitestreamReplica`, the Deployment still has injection annotations.
+
+**Cause**: The CR's finalizer should have cleaned these up. If the operator was down during deletion, annotations may remain.
+
+**Fix**: Manually remove `litestream.io/inject` and `litestream.io/config` annotations from the Deployment's pod template.
 
 ---
 
 ## Helm chart values
 
 ```bash
-# List all available values
-helm show values oci://ghcr.io/jlaska/charts/litestream-operator --version 0.2.0
+helm show values oci://ghcr.io/jlaska/charts/litestream-operator --version 0.4.1
 ```
 
 Key values:
