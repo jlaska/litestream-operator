@@ -244,6 +244,11 @@ func main() {
 			os.Exit(1)
 		}
 
+		if err := (&litestreamwebhook.LitestreamRestoreValidator{}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "LitestreamRestore")
+			os.Exit(1)
+		}
+
 		mgr.GetWebhookServer().Register("/mutate-core-v1-pod", &webhook.Admission{
 			Handler: &litestreamwebhook.SidecarInjector{
 				Client:  mgr.GetAPIReader(),

@@ -85,10 +85,10 @@ var _ = Describe("Integration", Ordered, func() {
 				g.Expect(out).To(ContainSubstring("litestream"))
 			}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
-			By("confirming SidecarInjected condition is True on the LitestreamReplica")
+			By("confirming SidecarReady condition is True on the LitestreamReplica")
 			Eventually(func(g Gomega) {
 				out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
-					"-o", `jsonpath={.status.conditions[?(@.type=="SidecarInjected")].status}`)
+					"-o", `jsonpath={.status.conditions[?(@.type=="SidecarReady")].status}`)
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(out).To(Equal("True"))
 			}).Should(Succeed())
@@ -124,7 +124,7 @@ var _ = Describe("Integration", Ordered, func() {
 			kubectl("wait", "-n", testNamespace, "deployment/"+appName,
 				"--for=condition=Available", "--timeout=3m")
 
-			By("creating LitestreamReplica CR with backup enabled and initSQL")
+			By("creating LitestreamReplica CR with backup enabled and bootstrap SQL")
 			applyLiteral(litestreamReplicaManifest(dbName, testNamespace, appName, dbFile, dbPath, true, initSQL))
 
 			By("waiting for sidecar injection rollout to complete (2/2 containers)")
@@ -142,7 +142,7 @@ var _ = Describe("Integration", Ordered, func() {
 			runIgnoreError("kubectl", "delete", "deployment", appName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
 		})
 
-		It("init container applies initSQL and creates the events table", func() {
+		It("bootstrap container applies bootstrap SQL and creates the events table", func() {
 			podName := runningPod(appName)
 			Eventually(func(g Gomega) {
 				out, err := kubectlQ("exec", "-n", testNamespace, podName, "-c", "app",
@@ -176,10 +176,10 @@ var _ = Describe("Integration", Ordered, func() {
 				}
 			}, 3*time.Minute, 10*time.Second).Should(Succeed())
 
-			By("verifying BackupHealthy condition is True on the LitestreamReplica")
+			By("verifying ReplicationHealthy condition is True on the LitestreamReplica")
 			Eventually(func(g Gomega) {
 				out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
-					"-o", `jsonpath={.status.conditions[?(@.type=="BackupHealthy")].status}`)
+					"-o", `jsonpath={.status.conditions[?(@.type=="ReplicationHealthy")].status}`)
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(out).To(Equal("True"))
 			}).Should(Succeed())
@@ -284,10 +284,10 @@ var _ = Describe("Replication Pause", Ordered, func() {
 			"--for=condition=Available", "--timeout=3m")
 		applyLiteral(litestreamReplicaManifest(dbName, testNamespace, appName, dbFile, dbPath, true, ""))
 
-		By("waiting for sidecar injection and BackupHealthy=True")
+		By("waiting for sidecar injection and ReplicationHealthy=True")
 		Eventually(func(g Gomega) {
 			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
-				"-o", `jsonpath={.status.conditions[?(@.type=="BackupHealthy")].status}`)
+				"-o", `jsonpath={.status.conditions[?(@.type=="ReplicationHealthy")].status}`)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(out).To(Equal("True"))
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
@@ -446,17 +446,17 @@ var _ = Describe("Archive Check — Data Loss Recovery", Ordered, func() {
 	BeforeAll(func() {
 		DeferCleanup(func() { dumpReplicationDiagnostics(appName, dbName, dbFile) })
 
-		By("creating PVC, Deployment, and LitestreamReplica CR with backup enabled and initSQL")
+		By("creating PVC, Deployment, and LitestreamReplica CR with backup enabled and bootstrap SQL")
 		applyLiteral(pvcManifest(pvcName, testNamespace))
 		applyLiteral(appDeploymentManifest(appName, testNamespace, pvcName, dbPath))
 		kubectl("wait", "-n", testNamespace, "deployment/"+appName,
 			"--for=condition=Available", "--timeout=3m")
 		applyLiteral(litestreamReplicaManifest(dbName, testNamespace, appName, dbFile, dbPath, true, initSQL))
 
-		By("waiting for sidecar injection and BackupHealthy=True")
+		By("waiting for sidecar injection and ReplicationHealthy=True")
 		Eventually(func(g Gomega) {
 			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
-				"-o", `jsonpath={.status.conditions[?(@.type=="BackupHealthy")].status}`)
+				"-o", `jsonpath={.status.conditions[?(@.type=="ReplicationHealthy")].status}`)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(out).To(Equal("True"))
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
@@ -514,12 +514,12 @@ var _ = Describe("Archive Check — Data Loss Recovery", Ordered, func() {
 				"expected archive-check init container to exit 1")
 		}, 3*time.Minute, 10*time.Second).Should(Succeed())
 
-		By("verifying ArchiveCheckFailed condition on LitestreamReplica")
+		By("verifying RecoverySafe=False on LitestreamReplica (archive mismatch detected)")
 		Eventually(func(g Gomega) {
 			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
-				"-o", `jsonpath={.status.conditions[?(@.type=="ArchiveCheckFailed")].status}`)
+				"-o", `jsonpath={.status.conditions[?(@.type=="RecoverySafe")].status}`)
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(out).To(Equal("True"))
+			g.Expect(out).To(Equal("False"))
 		}).Should(Succeed())
 	})
 
@@ -563,10 +563,10 @@ var _ = Describe("Archive Check — Data Loss Recovery", Ordered, func() {
 			g.Expect(out).To(ContainSubstring(itemValue))
 		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
-		By("verifying BackupHealthy=True after restore (Litestream resumed)")
+		By("verifying ReplicationHealthy=True after restore (Litestream resumed)")
 		Eventually(func(g Gomega) {
 			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
-				"-o", `jsonpath={.status.conditions[?(@.type=="BackupHealthy")].status}`)
+				"-o", `jsonpath={.status.conditions[?(@.type=="ReplicationHealthy")].status}`)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(out).To(Equal("True"))
 		}, 3*time.Minute, 10*time.Second).Should(Succeed())
@@ -599,7 +599,7 @@ var _ = Describe("Archive Check — Fresh DB Divergence", Ordered, func() {
 	BeforeAll(func() {
 		DeferCleanup(func() { dumpReplicationDiagnostics(appName, dbName, dbFile) })
 
-		By("creating PVC, Deployment, and LitestreamReplica CR with backup enabled and initSQL")
+		By("creating PVC, Deployment, and LitestreamReplica CR with backup enabled and bootstrap SQL")
 		// runAsUser: 0 — db-init runs as root so it can read the restored DB file,
 		// which litestream restore writes as root. This demonstrates that issue #110
 		// is fixed: callers now control the UID instead of the operator hardcoding root.
@@ -608,12 +608,12 @@ var _ = Describe("Archive Check — Fresh DB Divergence", Ordered, func() {
 		applyLiteral(appDeploymentManifest(appName, testNamespace, pvcName, dbPath))
 		kubectl("wait", "-n", testNamespace, "deployment/"+appName,
 			"--for=condition=Available", "--timeout=3m")
-		applyLiteral(litestreamReplicaManifestFull(dbName, testNamespace, appName, dbFile, dbPath, true, initSQL, false, &rootUID))
+		applyLiteral(litestreamReplicaManifestFull(dbName, testNamespace, appName, dbFile, dbPath, true, initSQL, databasev1.RecoveryModeManual, &rootUID))
 
-		By("waiting for sidecar injection and BackupHealthy=True")
+		By("waiting for sidecar injection and ReplicationHealthy=True")
 		Eventually(func(g Gomega) {
 			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
-				"-o", `jsonpath={.status.conditions[?(@.type=="BackupHealthy")].status}`)
+				"-o", `jsonpath={.status.conditions[?(@.type=="ReplicationHealthy")].status}`)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(out).To(Equal("True"))
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
@@ -685,12 +685,12 @@ var _ = Describe("Archive Check — Fresh DB Divergence", Ordered, func() {
 				"expected archive-check to exit 1: DB exists but state dir absent with S3 backup present")
 		}, 3*time.Minute, 10*time.Second).Should(Succeed())
 
-		By("verifying ArchiveCheckFailed condition on LitestreamReplica")
+		By("verifying RecoverySafe=False on LitestreamReplica (archive mismatch detected)")
 		Eventually(func(g Gomega) {
 			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
-				"-o", `jsonpath={.status.conditions[?(@.type=="ArchiveCheckFailed")].status}`)
+				"-o", `jsonpath={.status.conditions[?(@.type=="RecoverySafe")].status}`)
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(out).To(Equal("True"))
+			g.Expect(out).To(Equal("False"))
 		}).Should(Succeed())
 	})
 
@@ -738,10 +738,10 @@ var _ = Describe("Archive Check — Fresh DB Divergence", Ordered, func() {
 			g.Expect(out).To(ContainSubstring(itemValue))
 		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
-		By("verifying BackupHealthy=True after restore (Litestream resumed and state dir created)")
+		By("verifying ReplicationHealthy=True after restore (Litestream resumed and state dir created)")
 		Eventually(func(g Gomega) {
 			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
-				"-o", `jsonpath={.status.conditions[?(@.type=="BackupHealthy")].status}`)
+				"-o", `jsonpath={.status.conditions[?(@.type=="ReplicationHealthy")].status}`)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(out).To(Equal("True"))
 		}, 3*time.Minute, 10*time.Second).Should(Succeed())
@@ -820,19 +820,19 @@ var _ = Describe("First-Time Setup", Ordered, func() {
 			g.Expect(out).To(Equal("Ready"))
 		}, 3*time.Minute, 5*time.Second).Should(Succeed())
 
-		By("verifying BackupHealthy=True after sidecar begins replicating")
+		By("verifying ReplicationHealthy=True after sidecar begins replicating")
 		Eventually(func(g Gomega) {
 			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
-				"-o", `jsonpath={.status.conditions[?(@.type=="BackupHealthy")].status}`)
+				"-o", `jsonpath={.status.conditions[?(@.type=="ReplicationHealthy")].status}`)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(out).To(Equal("True"))
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 	})
 })
 
-// ── TC-03: autoRestore=true — Automatic Restore on Startup ───────────────
+// ── TC-03: recovery.mode=Automatic — Automatic Restore on Startup ───────────────
 //
-// When autoRestore=true and the DB is missing but S3 has data, the restore
+// When recovery.mode=Automatic and the DB is missing but S3 has data, the restore
 // init container runs automatically and the pod starts with restored data.
 
 var _ = Describe("Auto-Restore on Startup", Ordered, func() {
@@ -849,17 +849,17 @@ var _ = Describe("Auto-Restore on Startup", Ordered, func() {
 	BeforeAll(func() {
 		DeferCleanup(func() { dumpReplicationDiagnostics(appName, dbName, dbFile) })
 
-		By("creating PVC, Deployment, and LitestreamReplica with autoRestore=true")
+		By("creating PVC, Deployment, and LitestreamReplica with recovery.mode=Automatic")
 		applyLiteral(pvcManifest(pvcName, testNamespace))
 		applyLiteral(appDeploymentManifest(appName, testNamespace, pvcName, dbPath))
 		kubectl("wait", "-n", testNamespace, "deployment/"+appName,
 			"--for=condition=Available", "--timeout=3m")
-		applyLiteral(litestreamReplicaManifestWithOpts(dbName, testNamespace, appName, dbFile, dbPath, true, initSQL, true))
+		applyLiteral(litestreamReplicaManifestWithOpts(dbName, testNamespace, appName, dbFile, dbPath, true, initSQL, databasev1.RecoveryModeAutomatic))
 
-		By("waiting for sidecar injection and BackupHealthy=True")
+		By("waiting for sidecar injection and ReplicationHealthy=True")
 		Eventually(func(g Gomega) {
 			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
-				"-o", `jsonpath={.status.conditions[?(@.type=="BackupHealthy")].status}`)
+				"-o", `jsonpath={.status.conditions[?(@.type=="ReplicationHealthy")].status}`)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(out).To(Equal("True"))
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
@@ -891,7 +891,7 @@ var _ = Describe("Auto-Restore on Startup", Ordered, func() {
 		runIgnoreError("kubectl", "delete", "pvc", pvcName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
 	})
 
-	It("auto-restores DB from S3 on startup when DB is missing and autoRestore=true", func() {
+	It("auto-restores DB from S3 on startup when DB is missing and recovery.mode=Automatic", func() {
 		podName := runningPod(appName)
 
 		By("deleting the DB file and litestream state directory to simulate data loss")
@@ -953,10 +953,10 @@ var _ = Describe("Auto-Restore on Startup", Ordered, func() {
 			g.Expect(out).To(ContainSubstring(testValue))
 		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
-		By("verifying BackupHealthy=True after restore (Litestream resumed)")
+		By("verifying ReplicationHealthy=True after restore (Litestream resumed)")
 		Eventually(func(g Gomega) {
 			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
-				"-o", `jsonpath={.status.conditions[?(@.type=="BackupHealthy")].status}`)
+				"-o", `jsonpath={.status.conditions[?(@.type=="ReplicationHealthy")].status}`)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(out).To(Equal("True"))
 		}, 3*time.Minute, 10*time.Second).Should(Succeed())
@@ -990,10 +990,10 @@ var _ = Describe("Restore Fails With Existing DB", Ordered, func() {
 			"--for=condition=Available", "--timeout=3m")
 		applyLiteral(litestreamReplicaManifest(dbName, testNamespace, appName, dbFile, dbPath, true, initSQL))
 
-		By("waiting for sidecar injection and BackupHealthy=True")
+		By("waiting for sidecar injection and ReplicationHealthy=True")
 		Eventually(func(g Gomega) {
 			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
-				"-o", `jsonpath={.status.conditions[?(@.type=="BackupHealthy")].status}`)
+				"-o", `jsonpath={.status.conditions[?(@.type=="ReplicationHealthy")].status}`)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(out).To(Equal("True"))
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
@@ -1109,10 +1109,10 @@ var _ = Describe("Point-in-Time Restore", Ordered, func() {
 			"--for=condition=Available", "--timeout=3m")
 		applyLiteral(litestreamReplicaManifest(dbName, testNamespace, appName, dbFile, dbPath, true, initSQL))
 
-		By("waiting for sidecar injection and BackupHealthy=True")
+		By("waiting for sidecar injection and ReplicationHealthy=True")
 		Eventually(func(g Gomega) {
 			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
-				"-o", `jsonpath={.status.conditions[?(@.type=="BackupHealthy")].status}`)
+				"-o", `jsonpath={.status.conditions[?(@.type=="ReplicationHealthy")].status}`)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(out).To(Equal("True"))
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
@@ -1292,16 +1292,16 @@ spec:
 }
 
 func litestreamReplicaManifest(name, ns, target, dbFile, dbPath string, backupEnabled bool, initSQL string) string {
-	return litestreamReplicaManifestWithOpts(name, ns, target, dbFile, dbPath, backupEnabled, initSQL, false)
+	return litestreamReplicaManifestWithOpts(name, ns, target, dbFile, dbPath, backupEnabled, initSQL, databasev1.RecoveryModeManual)
 }
 
-func litestreamReplicaManifestWithOpts(name, ns, target, dbFile, dbPath string, backupEnabled bool, initSQL string, autoRestore bool) string {
-	return litestreamReplicaManifestFull(name, ns, target, dbFile, dbPath, backupEnabled, initSQL, autoRestore, nil)
+func litestreamReplicaManifestWithOpts(name, ns, target, dbFile, dbPath string, backupEnabled bool, initSQL string, recoveryMode databasev1.RecoveryMode) string {
+	return litestreamReplicaManifestFull(name, ns, target, dbFile, dbPath, backupEnabled, initSQL, recoveryMode, nil)
 }
 
 // litestreamReplicaManifestFull is the full-featured constructor. runAsUser sets the UID for
-// Litestream-managed init containers (archive-check, db-init). When nil the image default is used.
-func litestreamReplicaManifestFull(name, ns, target, dbFile, dbPath string, backupEnabled bool, initSQL string, autoRestore bool, runAsUser *int64) string {
+// Litestream-managed init containers (archive-check, bootstrap). When nil the image default is used.
+func litestreamReplicaManifestFull(name, ns, target, dbFile, dbPath string, backupEnabled bool, initSQL string, recoveryMode databasev1.RecoveryMode, runAsUser *int64) string {
 	db := &databasev1.LitestreamReplica{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "litestream.io/v1", Kind: "LitestreamReplica"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
@@ -1309,14 +1309,14 @@ func litestreamReplicaManifestFull(name, ns, target, dbFile, dbPath string, back
 			DatabaseName:     dbFile,
 			DatabasePath:     dbPath,
 			TargetDeployment: target,
-			InitSQL:          initSQL,
+			Bootstrap:        databasev1.BootstrapSpec{SQL: initSQL},
+			Recovery:         databasev1.RecoverySpec{Mode: recoveryMode},
 			RunAsUser:        runAsUser,
 		},
 	}
 	if backupEnabled {
 		db.Spec.Backup = databasev1.BackupSpec{
-			Enabled:     true,
-			AutoRestore: autoRestore,
+			Enabled: true,
 			Destination: databasev1.BackupDestination{
 				S3: &databasev1.S3Destination{
 					Endpoint:  minioEndpoint,
@@ -1343,10 +1343,10 @@ func litestreamRestoreManifestWithForce(name, ns, sourceRef, pvc, targetPath str
 		TypeMeta:   metav1.TypeMeta{APIVersion: "litestream.io/v1", Kind: "LitestreamRestore"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec: databasev1.LitestreamRestoreSpec{
-			SourceRef:  sourceRef,
-			TargetPVC:  pvc,
-			TargetPath: targetPath,
-			Force:      true,
+			SourceRef: databasev1.RestoreSourceRef{Name: sourceRef},
+			Mode:      databasev1.RestoreModeToPVC,
+			Target:    &databasev1.RestoreTarget{PVC: pvc, Path: targetPath},
+			Force:     true,
 		},
 	}
 	data, err := sigsyaml.Marshal(restore)
@@ -1359,10 +1359,10 @@ func litestreamRestoreManifestWithTimestamp(name, ns, sourceRef, pvc, targetPath
 		TypeMeta:   metav1.TypeMeta{APIVersion: "litestream.io/v1", Kind: "LitestreamRestore"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec: databasev1.LitestreamRestoreSpec{
-			SourceRef:  sourceRef,
-			TargetPVC:  pvc,
-			TargetPath: targetPath,
-			Timestamp:  timestamp,
+			SourceRef: databasev1.RestoreSourceRef{Name: sourceRef},
+			Mode:      databasev1.RestoreModeToPVC,
+			Target:    &databasev1.RestoreTarget{PVC: pvc, Path: targetPath},
+			Timestamp: timestamp,
 		},
 	}
 	data, err := sigsyaml.Marshal(restore)

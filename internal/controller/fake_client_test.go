@@ -44,7 +44,11 @@ import (
 // newFakeDB creates a minimal LitestreamReplica for fake client tests.
 func newFakeDB(name, namespace, targetDep string) *databasev1.LitestreamReplica {
 	return &databasev1.LitestreamReplica{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       name,
+			Namespace:  namespace,
+			Finalizers: []string{replicaFinalizerName},
+		},
 		Spec: databasev1.LitestreamReplicaSpec{
 			DatabaseName:     "app.db",
 			DatabasePath:     "/data",
@@ -59,6 +63,55 @@ func newFakeDB(name, namespace, targetDep string) *databasev1.LitestreamReplica 
 	}
 }
 
+// newFakeDeploymentWithPVC returns a Deployment with a PVC volume mount at /data for InPlace restore tests.
+func newFakeDeploymentWithPVC(name, namespace string) *appsv1.Deployment {
+	replicas := int32(1)
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": name}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": name}},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name:  "app",
+						Image: "busybox",
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "data", MountPath: "/data"},
+						},
+					}},
+					Volumes: []corev1.Volume{{
+						Name: "data",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+								ClaimName: "restore-pvc",
+							},
+						},
+					}},
+				},
+			},
+		},
+	}
+}
+
+// newFakeInPlaceRestore returns a LitestreamRestore using InPlace mode for fake client tests.
+func newFakeInPlaceRestore(name, namespace, sourceRef, phase string) *databasev1.LitestreamRestore {
+	r := &databasev1.LitestreamRestore{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       name,
+			Namespace:  namespace,
+			Finalizers: []string{restoreFinalizerName},
+		},
+		Spec: databasev1.LitestreamRestoreSpec{
+			SourceRef: databasev1.RestoreSourceRef{Name: sourceRef},
+		},
+	}
+	r.Status.Phase = phase
+	return r
+}
+
 // newFakeDeployment returns a minimal single-replica Deployment for fake client tests.
 func newFakeDeployment(name, namespace string) *appsv1.Deployment {
 	replicas := int32(1)
@@ -66,6 +119,7 @@ func newFakeDeployment(name, namespace string) *appsv1.Deployment {
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
+			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
 			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": name}},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": name}},
@@ -76,16 +130,26 @@ func newFakeDeployment(name, namespace string) *appsv1.Deployment {
 }
 
 // newFakeRestore returns a minimal LitestreamRestore for fake client tests.
+// Uses ToPVC mode so tests don't need a real Deployment for PVC resolution.
 func newFakeRestore(name, namespace, sourceRef, phase string) *databasev1.LitestreamRestore {
 	r := &databasev1.LitestreamRestore{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       name,
+			Namespace:  namespace,
+			Finalizers: []string{restoreFinalizerName},
+		},
 		Spec: databasev1.LitestreamRestoreSpec{
-			SourceRef:  sourceRef,
-			TargetPVC:  "restore-pvc",
-			TargetPath: "/data/app.db",
+			SourceRef: databasev1.RestoreSourceRef{Name: sourceRef},
+			Mode:      databasev1.RestoreModeToPVC,
+			Target: &databasev1.RestoreTarget{
+				PVC:  "restore-pvc",
+				Path: "/data/app.db",
+			},
 		},
 	}
 	r.Status.Phase = phase
+	r.Status.ResolvedPVC = "restore-pvc"
+	r.Status.ResolvedPath = "/data/app.db"
 	return r
 }
 
@@ -230,12 +294,14 @@ var _ = Describe("LitestreamRestoreReconciler error injection", func() {
 		Expect(err.Error()).To(ContainSubstring("transient"))
 	})
 
-	It("reconcilePending returns error when pauseReplication Patch fails", func() {
+	It("reconcileAcquiringLock returns error when pauseReplication Patch fails (InPlace)", func() {
 		db := newFakeDB(srcDBName, ns, srcDepName)
-		// No Deployment in fake client — reconcilePending handles not-found gracefully.
-		restore := newFakeRestore(restoreName, ns, srcDBName, "")
+		dep := newFakeDeploymentWithPVC(srcDepName, ns)
+		restore := newFakeInPlaceRestore(restoreName, ns, srcDBName, databasev1.RestorePhaseAcquiringLock)
+		replicas := int32(1)
+		restore.Status.OriginalReplicas = &replicas
 
-		r := buildFakeRestoreClient([]client.Object{db, restore}, interceptor.Funcs{
+		r := buildFakeRestoreClient([]client.Object{db, dep, restore}, interceptor.Funcs{
 			Patch: func(ctx context.Context, c client.WithWatch, o client.Object, p client.Patch, opts ...client.PatchOption) error {
 				if _, ok := o.(*databasev1.LitestreamReplica); ok {
 					return fmt.Errorf("patch failed")
@@ -248,17 +314,17 @@ var _ = Describe("LitestreamRestoreReconciler error injection", func() {
 		Expect(err.Error()).To(ContainSubstring("setting pause annotation on LitestreamReplica"))
 	})
 
-	It("reconcilePausing returns error when Get(ConfigMap) fails", func() {
+	It("reconcileFencing returns error when Get(ConfigMap) fails", func() {
 		db := newFakeDB(srcDBName, ns, srcDepName)
-		// Pause annotation must be set so reconcilePausing skips the re-set-annotation branch.
+		// Pause annotation must be set so reconcileFencing skips the re-set-annotation branch.
 		db.Annotations = map[string]string{pauseAnnotation: injectEnabled}
 
-		restore := newFakeRestore(restoreName, ns, srcDBName, databasev1.RestorePhasePausing)
+		restore := newFakeRestore(restoreName, ns, srcDBName, databasev1.RestorePhaseFencing)
 		replicas := int32(1)
 		restore.Status.OriginalReplicas = &replicas
 
 		r := buildFakeRestoreClient([]client.Object{db, restore}, interceptor.Funcs{
-			// Return a non-NotFound error for ConfigMap so reconcilePausing fails.
+			// Return a non-NotFound error for ConfigMap so reconcileFencing fails.
 			Get: func(ctx context.Context, c client.WithWatch, k client.ObjectKey, o client.Object, opts ...client.GetOption) error {
 				if _, ok := o.(*corev1.ConfigMap); ok {
 					return fmt.Errorf("configmap get error")
@@ -271,20 +337,29 @@ var _ = Describe("LitestreamRestoreReconciler error injection", func() {
 		Expect(err.Error()).To(ContainSubstring("getting litestream ConfigMap"))
 	})
 
-	It("reconcileScalingDown returns error when Create(restore Job) fails with non-AlreadyExists error", func() {
+	It("reconcileFencing returns error when Create(restore Job) fails with non-AlreadyExists error", func() {
 		db := newFakeDB(srcDBName, ns, srcDepName)
 		db.Annotations = map[string]string{pauseAnnotation: injectEnabled}
+		dep := newFakeDeploymentWithPVC(srcDepName, ns)
+		// Set deployment replicas to 0 so fencing considers pods terminated.
+		zero := int32(0)
+		dep.Spec.Replicas = &zero
+		dep.Status.Replicas = 0
 		replicas := int32(1)
-		restore := newFakeRestore(restoreName, ns, srcDBName, databasev1.RestorePhaseScalingDown)
+		restore := newFakeRestore(restoreName, ns, srcDBName, databasev1.RestorePhaseFencing)
 		restore.Status.OriginalReplicas = &replicas
+		// Source DB's litestream ConfigMap with paused content.
+		sourceCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: srcDBName + "-litestream", Namespace: ns},
+			Data:       map[string]string{"litestream.yml": "dbs: []\n"},
+		}
 		// Pre-built restore litestream ConfigMap so reconcileRestoreConfig succeeds.
 		restoreCM := &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{Name: restoreName + "-litestream", Namespace: ns},
 			Data:       map[string]string{"litestream.yml": "addr: \":9090\"\ndbs:\n  - path: /data/app.db\n"},
 		}
 
-		r := buildFakeRestoreClient([]client.Object{db, restore, restoreCM}, interceptor.Funcs{
-			// Intercept only Job creates; ConfigMap creates (reconcileRestoreConfig) must succeed.
+		r := buildFakeRestoreClient([]client.Object{db, dep, restore, sourceCM, restoreCM}, interceptor.Funcs{
 			Create: func(ctx context.Context, c client.WithWatch, o client.Object, opts ...client.CreateOption) error {
 				if _, ok := o.(*batchv1.Job); ok {
 					return fmt.Errorf("quota exceeded")
@@ -297,9 +372,9 @@ var _ = Describe("LitestreamRestoreReconciler error injection", func() {
 		Expect(err.Error()).To(ContainSubstring("creating restore Job"))
 	})
 
-	It("reconcileRunning returns error when Get(restore Job) returns transient error", func() {
+	It("reconcileRestoring returns error when Get(restore Job) returns transient error", func() {
 		db := newFakeDB(srcDBName, ns, srcDepName)
-		restore := newFakeRestore(restoreName, ns, srcDBName, databasev1.RestorePhaseRunning)
+		restore := newFakeRestore(restoreName, ns, srcDBName, databasev1.RestorePhaseRestoring)
 		restore.Status.JobName = restoreName + "-restore"
 		replicas := int32(1)
 		restore.Status.OriginalReplicas = &replicas
@@ -317,36 +392,7 @@ var _ = Describe("LitestreamRestoreReconciler error injection", func() {
 		Expect(err.Error()).To(ContainSubstring("getting restore Job"))
 	})
 
-	It("reconcileValidating returns error when Get(validation Job) returns transient error", func() {
-		db := newFakeDB(srcDBName, ns, srcDepName)
-		restore := newFakeRestore(restoreName, ns, srcDBName, databasev1.RestorePhaseValidating)
-		restore.Status.JobName = restoreName + "-restore"
-		replicas := int32(1)
-		restore.Status.OriginalReplicas = &replicas
-
-		// Validation Job is present in the fake client, but Get is intercepted to fail.
-		validationJob := &batchv1.Job{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      restoreName + "-validate",
-				Namespace: ns,
-				Labels:    map[string]string{restoreLabelKey: restoreName},
-			},
-		}
-
-		r := buildFakeRestoreClient([]client.Object{db, restore, validationJob}, interceptor.Funcs{
-			Get: func(ctx context.Context, c client.WithWatch, k client.ObjectKey, o client.Object, opts ...client.GetOption) error {
-				if _, ok := o.(*batchv1.Job); ok {
-					return fmt.Errorf("transient")
-				}
-				return c.Get(ctx, k, o, opts...)
-			},
-		})
-		_, err := r.Reconcile(ctx, restoreKey)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("getting validation Job"))
-	})
-
-	It("reconcileScalingUp returns error when resumeReplication re-fetch of LitestreamReplica fails", func() {
+	It("reconcileResuming returns error when resumeReplication re-fetch of LitestreamReplica fails", func() {
 		db := newFakeDB(srcDBName, ns, srcDepName)
 		// Pause annotation must be set so resumeReplication proceeds to the re-fetch.
 		db.Annotations = map[string]string{pauseAnnotation: injectEnabled}
@@ -354,7 +400,7 @@ var _ = Describe("LitestreamRestoreReconciler error injection", func() {
 		// OriginalReplicas=0 skips the workload scale-back block so we reach
 		// resumeReplication directly without needing a Deployment in the fake client.
 		zero := int32(0)
-		restore := newFakeRestore(restoreName, ns, srcDBName, databasev1.RestorePhaseScalingUp)
+		restore := newFakeRestore(restoreName, ns, srcDBName, databasev1.RestorePhaseResuming)
 		restore.Status.OriginalReplicas = &zero
 
 		// Allow the first LitestreamReplica Get (Reconcile's sourceDB lookup) and the

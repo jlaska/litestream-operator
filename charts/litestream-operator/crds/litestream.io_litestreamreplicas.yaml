@@ -61,20 +61,6 @@ spec:
               backup:
                 description: Backup defines the Litestream replication / backup configuration.
                 properties:
-                  autoRestore:
-                    default: false
-                    description: |-
-                      AutoRestore, when true, replaces the archive-check init container with an
-                      upstream-style restore init container that automatically restores the database
-                      from S3 on pod startup (if the local DB is missing and a backup exists).
-                      A PRAGMA quick_check integrity gate is always run after restore; if it fails,
-                      the pod is blocked from starting.
-
-                      WARNING: Litestream has known restore corruption issues (#1164, #1220).
-                      The integrity gate catches corruption before the app starts. When false
-                      (the default), pod startup is blocked if S3 has data but the local DB is
-                      missing, requiring explicit recovery via a LitestreamRestore CR.
-                    type: boolean
                   destination:
                     description: Destination specifies where backups are stored.
                     properties:
@@ -203,6 +189,24 @@ spec:
                 required:
                 - enabled
                 type: object
+              bootstrap:
+                description: |-
+                  Bootstrap defines SQL to execute only when the database is genuinely new
+                  (no local DB file AND no remote archive). Applications should own schema
+                  migrations after bootstrap.
+                properties:
+                  image:
+                    default: keinos/sqlite3:latest
+                    description: |-
+                      Image is the container image used for the bootstrap init container.
+                      Must include the sqlite3 CLI.
+                    type: string
+                  sql:
+                    description: |-
+                      SQL contains one or more SQL statements to execute against the database
+                      when it is genuinely new. Use IF NOT EXISTS guards for safety.
+                    type: string
+                type: object
               databaseName:
                 description: DatabaseName is the filename of the SQLite database (e.g.
                   "paperless.db").
@@ -218,20 +222,22 @@ spec:
                 description: Image overrides the Litestream container image used for
                   the sidecar.
                 type: string
-              initImage:
-                default: keinos/sqlite3:latest
+              recovery:
                 description: |-
-                  InitImage is the container image used for the init container that
-                  applies InitSQL. Must include the sqlite3 CLI.
-                type: string
-              initSQL:
-                description: |-
-                  InitSQL contains one or more SQL statements to execute against the
-                  database on first use. The operator tracks a SHA-256 hash of this
-                  content; the statements are (re-)applied only when the hash changes,
-                  making updates idempotent across pod restarts.
-                  Use IF NOT EXISTS guards to make individual statements safe to re-run.
-                type: string
+                  Recovery configures startup recovery behavior when the local database
+                  is missing or inconsistent with the remote archive.
+                properties:
+                  mode:
+                    default: Manual
+                    description: |-
+                      Mode controls the recovery strategy.
+                      Manual (default): blocks startup if inconsistent, requiring explicit LitestreamRestore.
+                      Automatic: runs litestream restore with upstream idempotent flags and integrity check.
+                    enum:
+                    - Manual
+                    - Automatic
+                    type: string
+                type: object
               runAsGroup:
                 description: |-
                   RunAsGroup sets the GID for Litestream-managed init containers injected by the webhook.
@@ -241,7 +247,7 @@ spec:
               runAsUser:
                 description: |-
                   RunAsUser sets the UID for Litestream-managed init containers injected by the
-                  webhook (archive-check, auto-restore, db-init). When set, restored database files
+                  webhook (archive-check, auto-restore, bootstrap). When set, restored database files
                   are owned by this UID, allowing non-root application containers to read them.
                   When omitted, the container image's default user (root for litestream) is used.
                 format: int64
@@ -329,11 +335,10 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
-              initSQLHash:
+              injectedSpecHash:
                 description: |-
-                  InitSQLHash is the SHA-256 hash of the InitSQL currently configured in
-                  the spec. The init container uses this to name its marker file, so a
-                  hash change triggers re-application on next pod rollout.
+                  InjectedSpecHash is the hash of the injection-relevant spec fields currently
+                  applied to the target workload's pod template.
                 type: string
               lastBackup:
                 description: LastBackup is the timestamp of the most recent successful

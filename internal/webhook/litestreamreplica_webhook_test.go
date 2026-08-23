@@ -109,8 +109,8 @@ var _ = Describe("LitestreamReplicaValidator", func() {
 				errContains: "targetStatefulSet",
 			},
 			{
-				description:    "valid: autoRestore=true yields a warning but no error",
-				mutate:         func(db *databasev1.LitestreamReplica) { db.Spec.Backup.AutoRestore = true },
+				description:    "valid: recovery.mode=Automatic yields a warning but no error",
+				mutate:         func(db *databasev1.LitestreamReplica) { db.Spec.Recovery.Mode = databasev1.RecoveryModeAutomatic },
 				expectError:    false,
 				expectWarnings: true,
 			},
@@ -125,6 +125,12 @@ var _ = Describe("LitestreamReplicaValidator", func() {
 				mutate:      func(db *databasev1.LitestreamReplica) { db.Spec.DatabasePath = "" },
 				expectError: true,
 				errContains: "databasePath",
+			},
+			{
+				description: "invalid: relative databasePath",
+				mutate:      func(db *databasev1.LitestreamReplica) { db.Spec.DatabasePath = "relative/path" },
+				expectError: true,
+				errContains: "absolute path",
 			},
 			{
 				description: "invalid: backup enabled but S3 not configured",
@@ -283,7 +289,7 @@ var _ = Describe("LitestreamReplicaValidator", func() {
 			Expect(err.Error()).To(ContainSubstring("replicas"))
 		})
 
-		It("accepts targetDeployment with replicas == 1", func() {
+		It("accepts targetDeployment with replicas == 1 but warns on RollingUpdate strategy", func() {
 			const depName = "single-replica-dep"
 			replicas := int32(1)
 			dep := &appsv1.Deployment{
@@ -305,8 +311,38 @@ var _ = Describe("LitestreamReplicaValidator", func() {
 			db := newValidDB()
 			db.Spec.TargetDeployment = depName
 			v := &webhook.LitestreamReplicaValidator{Client: k8sClient}
-			_, err := v.ValidateCreate(ctx, db)
+			warnings, err := v.ValidateCreate(ctx, db)
 			Expect(err).NotTo(HaveOccurred())
+			Expect(warnings).NotTo(BeEmpty())
+			Expect(warnings[0]).To(ContainSubstring("RollingUpdate"))
+		})
+
+		It("does not warn on Recreate strategy", func() {
+			const depName = "recreate-dep"
+			replicas := int32(1)
+			dep := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Name: depName, Namespace: "default"},
+				Spec: appsv1.DeploymentSpec{
+					Replicas: &replicas,
+					Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
+					Selector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"app": depName},
+					},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": depName}},
+						Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, dep)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, dep) }()
+
+			db := newValidDB()
+			db.Spec.TargetDeployment = depName
+			v := &webhook.LitestreamReplicaValidator{Client: k8sClient}
+			warnings, err := v.ValidateCreate(ctx, db)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(warnings).To(BeEmpty())
 		})
 
 		It("accepts targetDeployment that does not yet exist (defers check to reconciler)", func() {

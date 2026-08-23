@@ -20,6 +20,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -100,6 +101,10 @@ func validateLitestreamReplica(ctx context.Context, c client.Client, db *databas
 	if db.Spec.DatabasePath == "" {
 		errs = append(errs, field.Required(spec.Child("databasePath"),
 			"databasePath must be set (e.g. \"/data\")"))
+	} else if !strings.HasPrefix(db.Spec.DatabasePath, "/") {
+		errs = append(errs, field.Invalid(spec.Child("databasePath"),
+			db.Spec.DatabasePath,
+			"must be an absolute path (start with /)"))
 	}
 
 	if db.Spec.Backup.Enabled {
@@ -121,21 +126,23 @@ func validateLitestreamReplica(ctx context.Context, c client.Client, db *databas
 		}
 	}
 
-	// Warn when autoRestore is enabled — known upstream corruption risk.
-	if db.Spec.Backup.AutoRestore {
+	// Warn when Automatic recovery is enabled — known upstream corruption risk.
+	if db.Spec.Recovery.Mode == databasev1.RecoveryModeAutomatic {
 		warnings = append(warnings,
-			"autoRestore: true carries a known restore-corruption risk (Litestream upstream #1164/#1220). "+
+			"recovery.mode: Automatic carries a known restore-corruption risk (Litestream upstream #1164/#1220). "+
 				"The integrity gate (PRAGMA quick_check) will catch corruption before the app starts, "+
 				"but consider using a LitestreamRestore CR for controlled, auditable recovery instead.")
 	}
 
-	// Optional replica-count check: requires a live API client and a resolvable workload.
+	// Optional workload checks: requires a live API client and a resolvable workload.
 	// Skip the check when the client is nil (unit tests) or the workload is not yet created.
 	if c != nil && !bothSet && !neitherSet {
-		if err := checkWorkloadReplicas(ctx, c, db, spec, &errs); err != nil {
+		workloadWarnings, err := checkWorkload(ctx, c, db, spec, &errs)
+		if err != nil {
 			// Unexpected API error — log and continue rather than blocking the admission.
-			webhookLog.Error(err, "replica count check failed; skipping", "name", db.Name)
+			webhookLog.Error(err, "workload check failed; skipping", "name", db.Name)
 		}
+		warnings = append(warnings, workloadWarnings...)
 	}
 
 	if len(errs) > 0 {
@@ -144,11 +151,14 @@ func validateLitestreamReplica(ctx context.Context, c client.Client, db *databas
 	return warnings, nil
 }
 
-// checkWorkloadReplicas looks up the target workload and appends a validation
-// error if it has more than one replica. Not-found errors are silently ignored
-// so that a LitestreamReplica can be created before the target workload exists.
-func checkWorkloadReplicas(ctx context.Context, c client.Client, db *databasev1.LitestreamReplica, spec *field.Path, errs *field.ErrorList) error {
-	var replicas int32
+// checkWorkload looks up the target workload and validates replica count and
+// rollout strategy. Not-found errors are silently ignored so that a
+// LitestreamReplica can be created before the target workload exists.
+func checkWorkload(ctx context.Context, c client.Client, db *databasev1.LitestreamReplica, spec *field.Path, errs *field.ErrorList) (admission.Warnings, error) {
+	var (
+		replicas int32
+		warnings admission.Warnings
+	)
 
 	if db.Spec.TargetStatefulSet != "" {
 		ss := &appsv1.StatefulSet{}
@@ -157,9 +167,9 @@ func checkWorkloadReplicas(ctx context.Context, c client.Client, db *databasev1.
 			Name:      db.Spec.TargetStatefulSet,
 		}, ss); err != nil {
 			if apierrors.IsNotFound(err) {
-				return nil // workload not yet created — defer check to reconciler
+				return nil, nil
 			}
-			return err
+			return nil, err
 		}
 		if ss.Spec.Replicas != nil {
 			replicas = *ss.Spec.Replicas
@@ -171,7 +181,7 @@ func checkWorkloadReplicas(ctx context.Context, c client.Client, db *databasev1.
 				spec.Child("targetStatefulSet"), db.Spec.TargetStatefulSet,
 				fmt.Sprintf("target StatefulSet has %d replicas; Litestream requires exactly 1 writer", replicas)))
 		}
-		return nil
+		return nil, nil
 	}
 
 	dep := &appsv1.Deployment{}
@@ -180,9 +190,9 @@ func checkWorkloadReplicas(ctx context.Context, c client.Client, db *databasev1.
 		Name:      db.Spec.TargetDeployment,
 	}, dep); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil
+			return nil, nil
 		}
-		return err
+		return nil, err
 	}
 	if dep.Spec.Replicas != nil {
 		replicas = *dep.Spec.Replicas
@@ -194,5 +204,12 @@ func checkWorkloadReplicas(ctx context.Context, c client.Client, db *databasev1.
 			spec.Child("targetDeployment"), db.Spec.TargetDeployment,
 			fmt.Sprintf("target Deployment has %d replicas; Litestream requires exactly 1 writer", replicas)))
 	}
-	return nil
+
+	if dep.Spec.Strategy.Type == appsv1.RollingUpdateDeploymentStrategyType || dep.Spec.Strategy.Type == "" {
+		warnings = append(warnings,
+			"target Deployment uses RollingUpdate strategy which can temporarily run two pods; "+
+				"Recreate or RollingUpdate with maxSurge=0 is recommended for single-writer SQLite safety")
+	}
+
+	return warnings, nil
 }

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -44,6 +45,7 @@ const (
 	restoreRequeueInterval  = 5 * time.Second
 	restoreLabelKey         = "litestream.io/restore"
 	restoreTargetVolumeName = "target"
+	restoreFinalizerName    = "litestream.io/restore-finalizer"
 )
 
 // LitestreamRestoreReconciler reconciles a LitestreamRestore object.
@@ -75,55 +77,216 @@ func (r *LitestreamRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, err
 	}
 
-	// Terminal phases — nothing more to do.
-	if restore.Status.Phase == databasev1.RestorePhaseComplete ||
-		restore.Status.Phase == databasev1.RestorePhaseFailed {
-		return ctrl.Result{}, nil
+	// Add finalizer if not present (before any mutations).
+	if !controllerutil.ContainsFinalizer(restore, restoreFinalizerName) {
+		controllerutil.AddFinalizer(restore, restoreFinalizerName)
+		if err := r.Update(ctx, restore); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
 	}
-
-	log.Info("Reconciling LitestreamRestore", "phase", restore.Status.Phase, "source", restore.Spec.SourceRef)
 
 	// Look up the referenced LitestreamReplica to get backup config and credentials.
 	sourceDB := &databasev1.LitestreamReplica{}
 	if err := r.Get(ctx, types.NamespacedName{
 		Namespace: restore.Namespace,
-		Name:      restore.Spec.SourceRef,
+		Name:      restore.Spec.SourceRef.Name,
 	}, sourceDB); err != nil {
+		if !errors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+		// Source not found — if being deleted, handle finalization; otherwise fail.
+		if !restore.DeletionTimestamp.IsZero() {
+			return r.handleFinalization(ctx, restore, nil)
+		}
 		return ctrl.Result{}, r.failRestore(ctx, restore,
-			fmt.Sprintf("LitestreamReplica %q not found: %v", restore.Spec.SourceRef, err))
+			fmt.Sprintf("LitestreamReplica %q not found: %v", restore.Spec.SourceRef.Name, err))
 	}
+
+	// Handle finalizer for safe cleanup during deletion.
+	if !restore.DeletionTimestamp.IsZero() {
+		return r.handleFinalization(ctx, restore, sourceDB)
+	}
+
+	// Terminal phases — nothing more to do.
+	if restore.Status.Phase == databasev1.RestorePhaseCompleted ||
+		restore.Status.Phase == databasev1.RestorePhaseFailed {
+		return ctrl.Result{}, nil
+	}
+
+	log.Info("Reconciling LitestreamRestore", "phase", restore.Status.Phase, "source", restore.Spec.SourceRef.Name)
 
 	if !sourceDB.Spec.Backup.Enabled || sourceDB.Spec.Backup.Destination.S3 == nil {
 		return ctrl.Result{}, r.failRestore(ctx, restore,
-			fmt.Sprintf("LitestreamReplica %q does not have backup enabled with an S3 destination", restore.Spec.SourceRef))
+			fmt.Sprintf("LitestreamReplica %q does not have backup enabled with an S3 destination", restore.Spec.SourceRef.Name))
 	}
 
 	switch restore.Status.Phase {
 	case "", databasev1.RestorePhasePending:
 		return r.reconcilePending(ctx, restore, sourceDB)
-	case databasev1.RestorePhasePausing:
-		return r.reconcilePausing(ctx, restore, sourceDB)
-	case databasev1.RestorePhaseScalingDown:
-		return r.reconcileScalingDown(ctx, restore, sourceDB)
-	case databasev1.RestorePhaseRunning:
-		return r.reconcileRunning(ctx, restore, sourceDB)
+	case databasev1.RestorePhaseAcquiringLock:
+		return r.reconcileAcquiringLock(ctx, restore, sourceDB)
+	case databasev1.RestorePhaseFencing:
+		return r.reconcileFencing(ctx, restore, sourceDB)
+	case databasev1.RestorePhaseRestoring:
+		return r.reconcileRestoring(ctx, restore, sourceDB)
 	case databasev1.RestorePhaseValidating:
-		return r.reconcileValidating(ctx, restore, sourceDB)
-	case databasev1.RestorePhaseScalingUp:
-		return r.reconcileScalingUp(ctx, restore, sourceDB)
+		// Integrity checking is now handled natively by litestream via -integrity-check.
+		// This case handles CRs that were in-flight during upgrade; transition them forward.
+		nextPhase := databasev1.RestorePhaseResuming
+		if restore.Spec.Mode == databasev1.RestoreModeToPVC {
+			nextPhase = databasev1.RestorePhaseCompleted
+		}
+		return ctrl.Result{RequeueAfter: restoreRequeueInterval}, r.setStatus(ctx, restore,
+			nextPhase, restore.Status.JobName, "skipping legacy validation phase",
+			restore.Status.OriginalReplicas, restore.Status.StartTime, nil)
+	case databasev1.RestorePhaseResuming:
+		return r.reconcileResuming(ctx, restore, sourceDB)
 	default:
 		return ctrl.Result{}, nil
 	}
 }
 
-// reconcilePending handles the initial phase: record original replicas, set pause
-// annotation on the LitestreamReplica, transition to Pausing.
+// handleFinalization handles safe cleanup when a LitestreamRestore is being deleted.
+// If the restore was mid-operation (Fencing/Restoring), the workload is left
+// fenced for safety — starting against uncertain data is worse than downtime.
+func (r *LitestreamRestoreReconciler) handleFinalization(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	if !controllerutil.ContainsFinalizer(restore, restoreFinalizerName) {
+		return ctrl.Result{}, nil
+	}
+
+	log.Info("Handling finalization of LitestreamRestore", "phase", restore.Status.Phase)
+
+	phase := restore.Status.Phase
+	if restore.Spec.Mode != databasev1.RestoreModeToPVC && sourceDB != nil {
+		isMidRestore := phase == databasev1.RestorePhaseFencing ||
+			phase == databasev1.RestorePhaseRestoring ||
+			phase == databasev1.RestorePhaseValidating
+
+		if isMidRestore {
+			log.Info("Restore CR deleted mid-operation; leaving workload fenced for safety",
+				"phase", phase)
+			r.Recorder.Eventf(restore, corev1.EventTypeWarning, "DeletedMidRestore",
+				"LitestreamRestore deleted during %s phase; workload left fenced — manual intervention required", phase)
+		} else {
+			if resumeErr := r.resumeReplication(ctx, sourceDB); resumeErr != nil {
+				log.Error(resumeErr, "Failed to remove pause annotation during finalization")
+			}
+		}
+	}
+
+	controllerutil.RemoveFinalizer(restore, restoreFinalizerName)
+	if err := r.Update(ctx, restore); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+// resolveRestoreTarget resolves the target PVC and path for the restore.
+// For InPlace mode, it derives them from the source LitestreamReplica's target workload.
+// For ToPVC mode, it reads them from the restore spec.
+func (r *LitestreamRestoreReconciler) resolveRestoreTarget(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) (pvc, path string, err error) {
+	if restore.Spec.Mode == databasev1.RestoreModeToPVC {
+		if restore.Spec.Target == nil {
+			return "", "", fmt.Errorf("mode is ToPVC but target is not specified")
+		}
+		return restore.Spec.Target.PVC, restore.Spec.Target.Path, nil
+	}
+
+	// InPlace mode: derive from source workload.
+	wt, err := r.getTargetWorkloadForRestore(ctx, sourceDB)
+	if err != nil {
+		return "", "", fmt.Errorf("resolving InPlace target: cannot find workload for LitestreamReplica %q: %w", sourceDB.Name, err)
+	}
+
+	dbPath := sourceDB.Spec.DatabasePath
+	dbFullPath := dbPath + "/" + sourceDB.Spec.DatabaseName
+
+	// Find the volume mount covering the database path in the first container.
+	var podSpec corev1.PodSpec
+	if wt.deployment != nil {
+		podSpec = wt.deployment.Spec.Template.Spec
+	} else {
+		podSpec = wt.statefulSet.Spec.Template.Spec
+	}
+
+	if len(podSpec.Containers) == 0 {
+		return "", "", fmt.Errorf("target workload has no containers")
+	}
+
+	var volumeName string
+	for _, vm := range podSpec.Containers[0].VolumeMounts {
+		if vm.MountPath == dbPath || strings.HasPrefix(dbPath, vm.MountPath+"/") {
+			volumeName = vm.Name
+			break
+		}
+	}
+	if volumeName == "" {
+		return "", "", fmt.Errorf("no volume mount in container %q covers database path %q", podSpec.Containers[0].Name, dbPath)
+	}
+
+	for _, vol := range podSpec.Volumes {
+		if vol.Name == volumeName && vol.PersistentVolumeClaim != nil {
+			return vol.PersistentVolumeClaim.ClaimName, dbFullPath, nil
+		}
+	}
+
+	return "", "", fmt.Errorf("volume %q backing database path %q is not a PersistentVolumeClaim", volumeName, dbPath)
+}
+
+// reconcilePending handles the initial phase.
+// For InPlace: record original replicas, resolve target, set pause annotation, transition to Pausing.
+// For ToPVC: resolve target, create restore job directly (no workload fencing needed).
 func (r *LitestreamRestoreReconciler) reconcilePending(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	// Record original replica count. If the workload is already gone (e.g. the
-	// app was torn down before the restore), treat it as already at 0 — the
-	// scale-down step will be skipped and the restore Job runs immediately.
+	// Resolve target PVC and path.
+	targetPVC, targetPath, err := r.resolveRestoreTarget(ctx, restore, sourceDB)
+	if err != nil {
+		return ctrl.Result{}, r.failRestore(ctx, restore,
+			fmt.Sprintf("resolving restore target: %v", err))
+	}
+
+	// Store resolved target in status for use in later phases.
+	if restore.Status.ResolvedPVC == "" {
+		patch := client.MergeFrom(restore.DeepCopy())
+		restore.Status.ResolvedPVC = targetPVC
+		restore.Status.ResolvedPath = targetPath
+		if err := r.Status().Patch(ctx, restore, patch); err != nil {
+			return ctrl.Result{}, fmt.Errorf("storing resolved target in status: %w", err)
+		}
+	}
+
+	if restore.Spec.Mode == databasev1.RestoreModeToPVC {
+		// ToPVC: skip workload fencing entirely — go straight to creating the restore job.
+		if err := r.reconcileRestoreConfig(ctx, restore, sourceDB); err != nil {
+			return ctrl.Result{}, fmt.Errorf("creating restore litestream config: %w", err)
+		}
+
+		jobName := restore.Name + "-restore"
+		newJob := r.buildRestoreJob(restore, sourceDB, jobName, targetPVC, targetPath)
+		if err := controllerutil.SetControllerReference(restore, newJob, r.Scheme); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.Create(ctx, newJob); err != nil {
+			if !errors.IsAlreadyExists(err) {
+				return ctrl.Result{}, fmt.Errorf("creating restore Job: %w", err)
+			}
+		}
+
+		log.Info("Created restore Job (ToPVC)", "job", jobName)
+		r.Recorder.Eventf(restore, corev1.EventTypeNormal, "RestoreStarted",
+			"Created restore Job %s (mode: ToPVC)", jobName)
+
+		now := metav1.Now()
+		return ctrl.Result{RequeueAfter: restoreRequeueInterval}, r.setStatus(ctx, restore,
+			databasev1.RestorePhaseRestoring, jobName, "restore Job running",
+			nil, &now, nil)
+	}
+
+	// InPlace mode: record original replicas and transition to AcquiringLock.
 	originalReplicas := int32(0)
 	wt, err := r.getTargetWorkloadForRestore(ctx, sourceDB)
 	switch {
@@ -136,24 +299,36 @@ func (r *LitestreamRestoreReconciler) reconcilePending(ctx context.Context, rest
 			fmt.Sprintf("getting target workload for LitestreamReplica %q: %v", sourceDB.Name, err))
 	}
 
+	log.Info("Transitioning to AcquiringLock", "originalReplicas", originalReplicas)
+
+	now := metav1.Now()
+	return ctrl.Result{RequeueAfter: restoreRequeueInterval}, r.setStatus(ctx, restore,
+		databasev1.RestorePhaseAcquiringLock, restore.Status.JobName, "acquiring restore lock",
+		&originalReplicas, &now, nil)
+}
+
+// reconcileAcquiringLock is a placeholder for the restore lock that will be
+// implemented in Phase 3. For now it transitions directly to Fencing.
+func (r *LitestreamRestoreReconciler) reconcileAcquiringLock(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) (ctrl.Result, error) {
 	if err := r.pauseReplication(ctx, sourceDB); err != nil {
 		return ctrl.Result{}, fmt.Errorf("setting pause annotation on LitestreamReplica: %w", err)
 	}
 
-	log.Info("Pausing replication before restore", "originalReplicas", originalReplicas)
 	r.Recorder.Eventf(restore, corev1.EventTypeNormal, "PausingReplication",
 		"Pausing Litestream replication on LitestreamReplica %s", sourceDB.Name)
 
-	now := metav1.Now()
+	setCondition(&restore.Status.Conditions, databasev1.RestoreConditionLocked,
+		metav1.ConditionTrue, "LockAcquired", "restore lock acquired",
+		restore.Generation, metav1.Now())
+
 	return ctrl.Result{RequeueAfter: restoreRequeueInterval}, r.setStatus(ctx, restore,
-		databasev1.RestorePhasePausing, restore.Status.JobName, "pausing replication",
-		&originalReplicas, &now, nil)
+		databasev1.RestorePhaseFencing, restore.Status.JobName, "fencing application",
+		restore.Status.OriginalReplicas, restore.Status.StartTime, nil)
 }
 
-// reconcilePausing waits for the ConfigMap to reflect the pause (dbs: []) and then
-// scales the Deployment to 0. The ConfigMap update is async (kubelet propagation),
-// so we check the ConfigMap content before scaling.
-func (r *LitestreamRestoreReconciler) reconcilePausing(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) (ctrl.Result, error) {
+// reconcileFencing handles pausing replication, scaling the workload to 0, and
+// waiting for pods to terminate before creating the restore Job.
+func (r *LitestreamRestoreReconciler) reconcileFencing(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	// Verify pause annotation is still set (defensive — could have been removed).
@@ -188,44 +363,32 @@ func (r *LitestreamRestoreReconciler) reconcilePausing(ctx context.Context, rest
 		if scaleErr := r.scaleWorkload(ctx, wt, 0); scaleErr != nil {
 			return ctrl.Result{}, fmt.Errorf("scaling workload to 0: %w", scaleErr)
 		}
-		log.Info("Scaled workload to 0, waiting for pods to terminate")
-		r.Recorder.Eventf(restore, corev1.EventTypeNormal, "ScalingDown",
-			"Scaled %s %s to 0 replicas", wt.typeName(), wt.name())
+		if wt.runningReplicas() > 0 {
+			log.Info("Scaled workload to 0, waiting for pods to terminate")
+			r.Recorder.Eventf(restore, corev1.EventTypeNormal, "ApplicationFenced",
+				"Scaled %s %s to 0 replicas", wt.typeName(), wt.name())
+			return ctrl.Result{RequeueAfter: restoreRequeueInterval}, nil
+		}
 	} else {
-		log.Info("target workload not found during Pausing; proceeding without scale-down")
+		log.Info("target workload not found during Fencing; proceeding without scale-down")
 	}
 
-	return ctrl.Result{RequeueAfter: restoreRequeueInterval}, r.setStatus(ctx, restore,
-		databasev1.RestorePhaseScalingDown, restore.Status.JobName, "waiting for pods to terminate",
-		restore.Status.OriginalReplicas, restore.Status.StartTime, nil)
-}
+	// All pods terminated — set fenced condition.
+	setCondition(&restore.Status.Conditions, databasev1.RestoreConditionApplicationFenced,
+		metav1.ConditionTrue, "WorkloadScaledDown", "application is fenced",
+		restore.Generation, metav1.Now())
 
-// reconcileScalingDown polls until all pods have terminated, then creates the restore Job.
-// If the workload no longer exists, treat it as already at 0 replicas.
-func (r *LitestreamRestoreReconciler) reconcileScalingDown(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
+	targetPVC := restore.Status.ResolvedPVC
+	targetPath := restore.Status.ResolvedPath
 
-	wt, err := r.getTargetWorkloadForRestore(ctx, sourceDB)
-	if err != nil && !errors.IsNotFound(err) {
-		return ctrl.Result{}, r.failRestore(ctx, restore,
-			fmt.Sprintf("cannot find target workload: %v", err))
-	}
-
-	if err == nil && wt.runningReplicas() > 0 {
-		log.Info("Waiting for workload pods to terminate", "currentReplicas", wt.runningReplicas())
-		return ctrl.Result{RequeueAfter: restoreRequeueInterval}, nil
-	}
-
-	// All pods terminated — create a fresh litestream ConfigMap for the restore
-	// job. The source LitestreamReplica's ConfigMap is currently paused (dbs: []) so
-	// the restore job needs its own copy with the actual S3 replica config.
+	// Create a fresh litestream ConfigMap for the restore job.
 	if err := r.reconcileRestoreConfig(ctx, restore, sourceDB); err != nil {
 		return ctrl.Result{}, fmt.Errorf("creating restore litestream config: %w", err)
 	}
 
 	// Create the restore Job.
 	jobName := restore.Name + "-restore"
-	newJob := r.buildRestoreJob(restore, sourceDB, jobName)
+	newJob := r.buildRestoreJob(restore, sourceDB, jobName, targetPVC, targetPath)
 	if err := controllerutil.SetControllerReference(restore, newJob, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -241,18 +404,18 @@ func (r *LitestreamRestoreReconciler) reconcileScalingDown(ctx context.Context, 
 
 	now := metav1.Now()
 	return ctrl.Result{RequeueAfter: restoreRequeueInterval}, r.setStatus(ctx, restore,
-		databasev1.RestorePhaseRunning, jobName, "restore Job running",
+		databasev1.RestorePhaseRestoring, jobName, "restore Job running",
 		restore.Status.OriginalReplicas, &now, nil)
 }
 
-// reconcileRunning watches the restore Job and transitions to ScalingUp on success
-// or Failed (with cleanup) on failure.
-func (r *LitestreamRestoreReconciler) reconcileRunning(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) (ctrl.Result, error) {
+// reconcileRestoring watches the restore Job and transitions to Resuming (InPlace)
+// or Completed (ToPVC) on success, or Failed on failure. Integrity checking is
+// handled natively by litestream via the -integrity-check flag on the restore command.
+func (r *LitestreamRestoreReconciler) reconcileRestoring(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) (ctrl.Result, error) {
 	job := &batchv1.Job{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: restore.Namespace, Name: restore.Status.JobName}, job)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			// Job disappeared — treat as failure.
 			return ctrl.Result{}, r.failRestoreWithCleanup(ctx, restore, sourceDB, "restore Job not found")
 		}
 		return ctrl.Result{}, fmt.Errorf("getting restore Job: %w", err)
@@ -262,10 +425,23 @@ func (r *LitestreamRestoreReconciler) reconcileRunning(ctx context.Context, rest
 		switch cond.Type {
 		case batchv1.JobComplete:
 			if cond.Status == corev1.ConditionTrue {
+				setCondition(&restore.Status.Conditions, databasev1.RestoreConditionRestoreSucceeded,
+					metav1.ConditionTrue, "RestoreJobComplete", "restore Job completed with integrity check",
+					restore.Generation, metav1.Now())
+
+				if restore.Spec.Mode == databasev1.RestoreModeToPVC {
+					r.Recorder.Event(restore, corev1.EventTypeNormal, "RestoreComplete",
+						"Litestream restore completed successfully")
+					now := metav1.Now()
+					return ctrl.Result{}, r.setStatus(ctx, restore,
+						databasev1.RestorePhaseCompleted, restore.Status.JobName, "restore completed successfully",
+						restore.Status.OriginalReplicas, restore.Status.StartTime, &now)
+				}
+
 				r.Recorder.Event(restore, corev1.EventTypeNormal, "RestoreJobComplete",
-					"Restore Job completed; running integrity check")
+					"Restore Job completed; resuming application")
 				return ctrl.Result{RequeueAfter: restoreRequeueInterval}, r.setStatus(ctx, restore,
-					databasev1.RestorePhaseValidating, restore.Status.JobName, "running integrity check",
+					databasev1.RestorePhaseResuming, restore.Status.JobName, "resuming application",
 					restore.Status.OriginalReplicas, restore.Status.StartTime, nil)
 			}
 		case batchv1.JobFailed:
@@ -274,9 +450,6 @@ func (r *LitestreamRestoreReconciler) reconcileRunning(ctx context.Context, rest
 				if cond.Message != "" {
 					msg = cond.Message
 				}
-				// Fetch the litestream container logs so the user can see the actual
-				// error (e.g. "output file already exists") in status.message rather
-				// than a generic failure description.
 				if podLogs := r.restoreJobPodLogs(ctx, restore.Namespace, restore.Name); podLogs != "" {
 					msg = fmt.Sprintf("%s; litestream output: %s", msg, podLogs)
 				}
@@ -289,174 +462,20 @@ func (r *LitestreamRestoreReconciler) reconcileRunning(ctx context.Context, rest
 	return ctrl.Result{RequeueAfter: restoreRequeueInterval}, nil
 }
 
-// reconcileValidating creates a validation Job that runs PRAGMA quick_check on the
-// restored database. On success it transitions to ScalingUp; on failure it calls
-// failRestoreWithCleanup so the Deployment is scaled back up and replication resumed.
-// This catches the restore corruption known in upstream issues #1164 and #1220 before
-// the application restarts against a corrupt database.
-func (r *LitestreamRestoreReconciler) reconcileValidating(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) (ctrl.Result, error) {
+// reconcileResuming resumes replication, waits for the ConfigMap to reflect the
+// full config, then scales the workload back up and transitions to Completed.
+// Only used for InPlace mode.
+func (r *LitestreamRestoreReconciler) reconcileResuming(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	validationJobName := restore.Name + "-validate"
-
-	// Create the validation Job if it does not yet exist.
-	validationJob := &batchv1.Job{}
-	err := r.Get(ctx, types.NamespacedName{Namespace: restore.Namespace, Name: validationJobName}, validationJob)
-	if errors.IsNotFound(err) {
-		newJob := r.buildValidationJob(restore, sourceDB, validationJobName)
-		if setErr := controllerutil.SetControllerReference(restore, newJob, r.Scheme); setErr != nil {
-			return ctrl.Result{}, setErr
-		}
-		if createErr := r.Create(ctx, newJob); createErr != nil && !errors.IsAlreadyExists(createErr) {
-			return ctrl.Result{}, fmt.Errorf("creating validation Job: %w", createErr)
-		}
-		log.Info("Created integrity-check validation Job", "job", validationJobName)
-		r.Recorder.Eventf(restore, corev1.EventTypeNormal, "ValidationStarted",
-			"Running PRAGMA quick_check on restored database")
-		return ctrl.Result{RequeueAfter: restoreRequeueInterval}, nil
-	}
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("getting validation Job: %w", err)
-	}
-
-	for _, cond := range validationJob.Status.Conditions {
-		switch cond.Type {
-		case batchv1.JobComplete:
-			if cond.Status == corev1.ConditionTrue {
-				r.Recorder.Event(restore, corev1.EventTypeNormal, "ValidationPassed",
-					"Integrity check passed; scaling Deployment back up")
-				return ctrl.Result{RequeueAfter: restoreRequeueInterval}, r.setStatus(ctx, restore,
-					databasev1.RestorePhaseScalingUp, restore.Status.JobName, "scaling Deployment back up",
-					restore.Status.OriginalReplicas, restore.Status.StartTime, nil)
-			}
-		case batchv1.JobFailed:
-			if cond.Status == corev1.ConditionTrue {
-				msg := "integrity check failed on restored database: PRAGMA quick_check returned errors. " +
-					"The S3 backup may be corrupt (Litestream upstream #1164/#1220). " +
-					"Try creating a new LitestreamRestore CR with an earlier -timestamp."
-				return ctrl.Result{}, r.failRestoreWithCleanup(ctx, restore, sourceDB, msg)
-			}
-		}
-	}
-
-	// Validation Job still running.
-	return ctrl.Result{RequeueAfter: restoreRequeueInterval}, nil
-}
-
-// buildValidationJob constructs a Job that runs `sqlite3 <targetPath> "PRAGMA quick_check;"`.
-// It uses the initImage from the source LitestreamReplica (keinos/sqlite3 by default) which
-// includes the sqlite3 CLI. The job mounts the target PVC at the parent directory.
-func (r *LitestreamRestoreReconciler) buildValidationJob(
-	restore *databasev1.LitestreamRestore,
-	sourceDB *databasev1.LitestreamReplica,
-	jobName string,
-) *batchv1.Job {
-	image := sourceDB.Spec.InitImage
-	if image == "" {
-		image = "keinos/sqlite3:latest"
-	}
-
-	mountPath := filepath.Dir(restore.Spec.TargetPath)
-	jobLabels := map[string]string{
-		"app.kubernetes.io/managed-by": "litestream-operator",
-		restoreLabelKey:                restore.Name,
-	}
-
-	// Run PRAGMA quick_check; output must be exactly "ok" for the job to succeed.
-	script := fmt.Sprintf(
-		`result=$(sqlite3 %q "PRAGMA quick_check;"); if [ "$result" = "ok" ]; then echo "ok"; exit 0; fi; echo "integrity check failed: $result"; exit 1`,
-		restore.Spec.TargetPath,
-	)
-
-	// Match the validation job's UID/GID to the restore job so it can read the
-	// restored file. When not specified, default to root to preserve existing
-	// behavior (litestream writes as root by default).
-	var validationSecCtx *corev1.PodSecurityContext
-	if restore.Spec.RunAsUser != nil || restore.Spec.RunAsGroup != nil {
-		validationSecCtx = &corev1.PodSecurityContext{
-			RunAsUser:  restore.Spec.RunAsUser,
-			RunAsGroup: restore.Spec.RunAsGroup,
-		}
-	} else {
-		rootUID, rootGID := int64(0), int64(0)
-		validationSecCtx = &corev1.PodSecurityContext{
-			RunAsUser:  &rootUID,
-			RunAsGroup: &rootGID,
-		}
-	}
-
-	backoffLimit := int32(1)
-	return &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      jobName,
-			Namespace: restore.Namespace,
-			Labels:    jobLabels,
-		},
-		Spec: batchv1.JobSpec{
-			BackoffLimit: &backoffLimit,
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: jobLabels},
-				Spec: corev1.PodSpec{
-					RestartPolicy:   corev1.RestartPolicyNever,
-					SecurityContext: validationSecCtx,
-					Containers: []corev1.Container{
-						{
-							Name:    "db-integrity-check",
-							Image:   image,
-							Command: []string{"sh", "-c", script},
-							VolumeMounts: []corev1.VolumeMount{
-								{Name: restoreTargetVolumeName, MountPath: mountPath},
-							},
-						},
-					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "target",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: restore.Spec.TargetPVC,
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-// reconcileScalingUp resumes replication, waits for the ConfigMap to reflect the
-// full config, then scales the workload back up and transitions to Complete.
-//
-// Operation order matters here:
-//  1. Set skip-archive-check so the webhook omits the archive-check init container
-//     for any new pods (annotation must be visible before pod admission).
-//  2. Remove the pause annotation so the LitestreamReplica controller restores the
-//     ConfigMap from "dbs: []" to the full replica config.
-//  3. Wait for the ConfigMap to reflect the full config — mirrors the symmetry with
-//     reconcilePausing, which waits for the ConfigMap to reflect the pause before
-//     scaling down. Without this gate the litestream sidecar starts with an empty
-//     config, crashes immediately, and the pod never reaches Running.
-//  4. Scale the workload back up.
-func (r *LitestreamRestoreReconciler) reconcileScalingUp(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
-	// Step 1: set skip-archive-check before any pod is admitted. The mutating webhook
-	// fires synchronously during pod admission and reads the LitestreamReplica via an
-	// uncached reader, so the annotation must be persisted before the workload scales up.
 	if err := r.setSkipArchiveCheck(ctx, sourceDB, true); err != nil {
 		return ctrl.Result{}, fmt.Errorf("setting skip-archive-check on LitestreamReplica: %w", err)
 	}
 
-	// Step 2: remove the pause annotation. This triggers the LitestreamReplica controller
-	// to reconcile and restore the ConfigMap from "dbs: []" to the full replica config.
 	if err := r.resumeReplication(ctx, sourceDB); err != nil {
 		return ctrl.Result{}, fmt.Errorf("removing pause annotation from LitestreamReplica: %w", err)
 	}
 
-	// Step 3: wait for the ConfigMap to reflect the full (unpaused) config before
-	// scaling up. The litestream sidecar reads the ConfigMap at startup; if it still
-	// contains "dbs: []" the container exits immediately and the pod crash-loops.
 	cm := &corev1.ConfigMap{}
 	if err := r.Get(ctx, types.NamespacedName{
 		Namespace: sourceDB.Namespace,
@@ -470,7 +489,6 @@ func (r *LitestreamRestoreReconciler) reconcileScalingUp(ctx context.Context, re
 		return ctrl.Result{RequeueAfter: restoreRequeueInterval}, nil
 	}
 
-	// Step 4: scale the workload back up now that the ConfigMap is ready.
 	target := int32(1)
 	if restore.Status.OriginalReplicas != nil {
 		target = *restore.Status.OriginalReplicas
@@ -487,36 +505,38 @@ func (r *LitestreamRestoreReconciler) reconcileScalingUp(ctx context.Context, re
 		}
 	}
 
+	setCondition(&restore.Status.Conditions, databasev1.RestoreConditionApplicationResumed,
+		metav1.ConditionTrue, "WorkloadScaledUp", "application resumed",
+		restore.Generation, metav1.Now())
+
+	r.Recorder.Event(restore, corev1.EventTypeNormal, "ApplicationResumed",
+		"Application workload resumed after restore")
 	r.Recorder.Event(restore, corev1.EventTypeNormal, "RestoreComplete",
 		"Litestream restore completed successfully")
 
 	now := metav1.Now()
 	return ctrl.Result{}, r.setStatus(ctx, restore,
-		databasev1.RestorePhaseComplete, restore.Status.JobName, "restore completed successfully",
+		databasev1.RestorePhaseCompleted, restore.Status.JobName, "restore completed successfully",
 		restore.Status.OriginalReplicas, restore.Status.StartTime, &now)
 }
 
-// failRestoreWithCleanup transitions to Failed and attempts to restore the Deployment
-// to its original replica count and remove the pause annotation.
+// failRestoreWithCleanup transitions to Failed. For InPlace mode, the workload
+// is left FENCED (replicas=0) — availability loss is preferable to starting
+// against uncertain data. The user must investigate and either re-attempt the
+// restore or manually scale the workload back up.
 func (r *LitestreamRestoreReconciler) failRestoreWithCleanup(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica, msg string) error {
 	log := logf.FromContext(ctx)
 
-	// Best-effort cleanup: scale back up if still at 0 and the workload exists.
-	if wt, err := r.getTargetWorkloadForRestore(ctx, sourceDB); err == nil && wt.runningReplicas() == 0 {
-		target := int32(1)
-		if restore.Status.OriginalReplicas != nil {
-			target = *restore.Status.OriginalReplicas
-		}
-		if target > 0 {
-			if scaleErr := r.scaleWorkload(ctx, wt, target); scaleErr != nil {
-				log.Error(scaleErr, "Failed to scale workload back up during cleanup")
-			}
-		}
-	}
+	if restore.Spec.Mode != databasev1.RestoreModeToPVC {
+		log.Info("Restore failed; leaving workload fenced for safety — manual intervention required")
 
-	// Best-effort cleanup: remove pause annotation.
-	if resumeErr := r.resumeReplication(ctx, sourceDB); resumeErr != nil {
-		log.Error(resumeErr, "Failed to remove pause annotation during cleanup")
+		// Remove pause annotation so replication config is restored,
+		// but do NOT scale the workload back up.
+		if resumeErr := r.resumeReplication(ctx, sourceDB); resumeErr != nil {
+			log.Error(resumeErr, "Failed to remove pause annotation during cleanup")
+		}
+
+		msg = fmt.Sprintf("%s; APPLICATION IS FENCED (replicas=0) — manual intervention required to resume", msg)
 	}
 
 	r.Recorder.Event(restore, corev1.EventTypeWarning, "RestoreFailed", msg)
@@ -543,7 +563,6 @@ func (r *LitestreamRestoreReconciler) resumeReplication(ctx context.Context, db 
 	if db.Annotations[pauseAnnotation] != injectEnabled {
 		return nil // not paused
 	}
-	// Re-fetch to get the latest version before patching.
 	latest := &databasev1.LitestreamReplica{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: db.Namespace, Name: db.Name}, latest); err != nil {
 		return err
@@ -554,8 +573,6 @@ func (r *LitestreamRestoreReconciler) resumeReplication(ctx context.Context, db 
 }
 
 // setSkipArchiveCheck sets or removes the skip-archive-check annotation on a LitestreamReplica.
-// When enable=true the annotation is set; when false it is removed. The caller must re-fetch
-// the resource before patching to avoid update conflicts.
 func (r *LitestreamRestoreReconciler) setSkipArchiveCheck(ctx context.Context, db *databasev1.LitestreamReplica, enable bool) error {
 	latest := &databasev1.LitestreamReplica{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: db.Namespace, Name: db.Name}, latest); err != nil {
@@ -563,11 +580,11 @@ func (r *LitestreamRestoreReconciler) setSkipArchiveCheck(ctx context.Context, d
 	}
 	if enable {
 		if latest.Annotations[databasev1.AnnotationSkipArchiveCheck] == injectEnabled {
-			return nil // already set
+			return nil
 		}
 	} else {
 		if latest.Annotations[databasev1.AnnotationSkipArchiveCheck] != injectEnabled {
-			return nil // already absent
+			return nil
 		}
 	}
 	patch := client.MergeFrom(latest.DeepCopy())
@@ -586,7 +603,7 @@ func (r *LitestreamRestoreReconciler) setSkipArchiveCheck(ctx context.Context, d
 func (r *LitestreamRestoreReconciler) buildRestoreJob(
 	restore *databasev1.LitestreamRestore,
 	sourceDB *databasev1.LitestreamReplica,
-	jobName string,
+	jobName, targetPVC, targetPath string,
 ) *batchv1.Job {
 	s3 := sourceDB.Spec.Backup.Destination.S3
 
@@ -598,20 +615,12 @@ func (r *LitestreamRestoreReconciler) buildRestoreJob(
 		image = defaultLitestreamImage
 	}
 
-	// litestream restore -config /etc/litestream/litestream.yml \
-	//                    [-timestamp <ts>]                        \
-	//                    -o <targetPath>                          \
-	//                    <dbPathInConfig>
-	//
-	// The db path must match the 'dbs[].path' key in litestream.yml so
-	// Litestream can look up the replica config (endpoint, bucket, path).
-	// Litestream has no env-var equivalent for the S3 endpoint — it must
-	// come from the config file.
 	dbPathInConfig := sourceDB.Spec.DatabasePath + "/" + sourceDB.Spec.DatabaseName
 	args := []string{
 		"restore",
 		"-config", "/etc/litestream/litestream.yml",
-		"-o", restore.Spec.TargetPath,
+		"-integrity-check", "quick",
+		"-o", targetPath,
 	}
 	if restore.Spec.Force {
 		args = append(args, "-force")
@@ -621,7 +630,7 @@ func (r *LitestreamRestoreReconciler) buildRestoreJob(
 	}
 	args = append(args, dbPathInConfig)
 
-	mountPath := filepath.Dir(restore.Spec.TargetPath)
+	mountPath := filepath.Dir(targetPath)
 	jobLabels := map[string]string{
 		"app.kubernetes.io/managed-by": "litestream-operator",
 		restoreLabelKey:                restore.Name,
@@ -634,9 +643,7 @@ func (r *LitestreamRestoreReconciler) buildRestoreJob(
 				Name:  "litestream-restore",
 				Image: image,
 				Args:  args,
-				// Credentials via env vars (supported by Litestream).
-				// Endpoint is read from the mounted litestream.yml config.
-				Env: s3EnvVars(s3.SecretRef),
+				Env:   s3EnvVars(s3.SecretRef),
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: restoreTargetVolumeName, MountPath: mountPath},
 					{Name: "litestream-config", MountPath: "/etc/litestream", ReadOnly: true},
@@ -648,14 +655,11 @@ func (r *LitestreamRestoreReconciler) buildRestoreJob(
 				Name: "target",
 				VolumeSource: corev1.VolumeSource{
 					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-						ClaimName: restore.Spec.TargetPVC,
+						ClaimName: targetPVC,
 					},
 				},
 			},
 			{
-				// Dedicated restore config with full S3 replica settings.
-				// The source LitestreamReplica's ConfigMap is paused (dbs: []) during
-				// restore, so we use a fresh copy named after the restore CR.
 				Name: "litestream-config",
 				VolumeSource: corev1.VolumeSource{
 					ConfigMap: &corev1.ConfigMapVolumeSource{
@@ -692,9 +696,7 @@ func (r *LitestreamRestoreReconciler) buildRestoreJob(
 	return job
 }
 
-// reconcileRestoreConfig creates a dedicated litestream ConfigMap for the restore
-// job. The source LitestreamReplica's ConfigMap is paused (dbs: []) while a restore is in
-// progress, so the restore job needs its own copy of the full S3 replica config.
+// reconcileRestoreConfig creates a dedicated litestream ConfigMap for the restore job.
 func (r *LitestreamRestoreReconciler) reconcileRestoreConfig(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) error {
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -712,10 +714,6 @@ func (r *LitestreamRestoreReconciler) reconcileRestoreConfig(ctx context.Context
 }
 
 // s3EnvVars returns S3 credential env vars sourced from the named Secret.
-// Litestream supports LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY
-// as fallbacks for AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
-// The S3 endpoint is NOT settable via env var in Litestream — it must come
-// from the litestream.yml config file (mounted via buildRestoreJob).
 func s3EnvVars(secretRef string) []corev1.EnvVar {
 	return []corev1.EnvVar{
 		{
@@ -739,12 +737,8 @@ func s3EnvVars(secretRef string) []corev1.EnvVar {
 	}
 }
 
-// failRestore moves the restore to Failed with the given message.
 // restoreJobPodLogs fetches the logs from the most recent pod of a restore Job
 // (tail 30 lines) so the actual litestream error can be surfaced in status.message.
-// Returns an empty string on any error — log retrieval is best-effort.
-// restoreName is the LitestreamRestore CR name, which is also the value of the
-// litestream.io/restore label on Job pods (set in buildRestoreJob via jobLabels).
 func (r *LitestreamRestoreReconciler) restoreJobPodLogs(ctx context.Context, namespace, restoreName string) string {
 	if r.KubeClient == nil {
 		return ""
@@ -755,7 +749,6 @@ func (r *LitestreamRestoreReconciler) restoreJobPodLogs(ctx context.Context, nam
 	if err != nil || len(podList.Items) == 0 {
 		return ""
 	}
-	// Use the first (usually only) pod.
 	pod := podList.Items[0]
 	tail := int64(30)
 	req := r.KubeClient.CoreV1().Pods(namespace).GetLogs(pod.Name, &corev1.PodLogOptions{

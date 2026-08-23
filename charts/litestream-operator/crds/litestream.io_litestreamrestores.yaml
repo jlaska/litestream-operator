@@ -15,11 +15,11 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.sourceRef
+    - jsonPath: .spec.sourceRef.name
       name: Source
       type: string
-    - jsonPath: .spec.targetPVC
-      name: TargetPVC
+    - jsonPath: .spec.mode
+      name: Mode
       type: string
     - jsonPath: .status.phase
       name: Phase
@@ -68,38 +68,57 @@ spec:
                   Defaults to the image specified in the referenced LitestreamReplica, or
                   litestream/litestream:0.5.14 if neither is set.
                 type: string
-              runAsGroup:
+              mode:
+                default: InPlace
                 description: |-
-                  RunAsGroup sets the GID for both the restore Job and the validation Job pods.
-                  When omitted, the container image's default group is used.
+                  Mode selects the restore strategy.
+                  InPlace: derives target from source LitestreamReplica, fences app, restores, resumes.
+                  ToPVC: restores to a separate PVC without touching the source application.
+                enum:
+                - InPlace
+                - ToPVC
+                type: string
+              runAsGroup:
+                description: RunAsGroup sets the GID for both the restore Job and
+                  the validation Job pods.
                 format: int64
                 type: integer
               runAsUser:
-                description: |-
-                  RunAsUser sets the UID for both the restore Job and the validation Job pods.
-                  When omitted, the container image's default user is used (root for the standard
-                  litestream image). Set this to match your application's UID (e.g. 1000) so that
-                  the restored file is readable by non-root containers and to satisfy PSA Restricted
-                  namespaces which reject runAsUser: 0.
+                description: RunAsUser sets the UID for both the restore Job and the
+                  validation Job pods.
                 format: int64
                 type: integer
               sourceRef:
                 description: |-
-                  SourceRef is the name of the LitestreamReplica CR whose backup configuration
+                  SourceRef identifies the LitestreamReplica whose backup configuration
                   (S3 destination + credentials) should be used as the restore source.
                   The LitestreamReplica must be in the same namespace.
-                type: string
-              targetPVC:
+                properties:
+                  name:
+                    description: Name is the name of the LitestreamReplica CR in the
+                      same namespace.
+                    type: string
+                required:
+                - name
+                type: object
+              target:
                 description: |-
-                  TargetPVC is the name of the PersistentVolumeClaim that the restored
-                  database file will be written into. The PVC must already exist.
-                type: string
-              targetPath:
-                description: |-
-                  TargetPath is the full path (including filename) where the restored
-                  database file will be written inside the TargetPVC.
-                  Example: "/data/paperless.db"
-                type: string
+                  Target is required when mode is ToPVC. Specifies the PVC and path
+                  for the restored database.
+                properties:
+                  path:
+                    description: |-
+                      Path is the full path (including filename) where the restored
+                      database file will be written inside the PVC.
+                    type: string
+                  pvc:
+                    description: PVC is the name of the PersistentVolumeClaim to restore
+                      into.
+                    type: string
+                required:
+                - path
+                - pvc
+                type: object
               timestamp:
                 description: |-
                   Timestamp enables point-in-time recovery. When set, Litestream restores
@@ -109,8 +128,6 @@ spec:
                 type: string
             required:
             - sourceRef
-            - targetPVC
-            - targetPath
             type: object
           status:
             description: LitestreamRestoreStatus defines the observed state of a LitestreamRestore
@@ -121,6 +138,66 @@ spec:
                   or not).
                 format: date-time
                 type: string
+              conditions:
+                description: Conditions holds standard Kubernetes condition entries.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
               jobName:
                 description: JobName is the name of the Kubernetes Job created to
                   perform the restore.
@@ -138,6 +215,14 @@ spec:
                 type: integer
               phase:
                 description: Phase is the current lifecycle state.
+                type: string
+              resolvedPVC:
+                description: ResolvedPVC is the PVC name used for the restore, resolved
+                  at reconcile time.
+                type: string
+              resolvedPath:
+                description: ResolvedPath is the database path used for the restore,
+                  resolved at reconcile time.
                 type: string
               startTime:
                 description: StartTime is when the restore Job was created.

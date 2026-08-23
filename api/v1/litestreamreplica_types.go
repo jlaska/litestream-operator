@@ -84,19 +84,46 @@ type BackupSpec struct {
 	// sidecar container. When omitted, a default ephemeral-storage limit is applied
 	// to guard against silent disk-fill (upstream issue #1310).
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+}
 
-	// AutoRestore, when true, replaces the archive-check init container with an
-	// upstream-style restore init container that automatically restores the database
-	// from S3 on pod startup (if the local DB is missing and a backup exists).
-	// A PRAGMA quick_check integrity gate is always run after restore; if it fails,
-	// the pod is blocked from starting.
-	//
-	// WARNING: Litestream has known restore corruption issues (#1164, #1220).
-	// The integrity gate catches corruption before the app starts. When false
-	// (the default), pod startup is blocked if S3 has data but the local DB is
-	// missing, requiring explicit recovery via a LitestreamRestore CR.
-	// +kubebuilder:default=false
-	AutoRestore bool `json:"autoRestore,omitempty"`
+// RecoveryMode controls how the operator handles pod startup when local
+// database state is missing or inconsistent with the remote archive.
+// +kubebuilder:validation:Enum=Manual;Automatic
+type RecoveryMode string
+
+const (
+	// RecoveryModeManual blocks workload startup if local state is
+	// inconsistent with the remote archive, requiring explicit LitestreamRestore.
+	RecoveryModeManual RecoveryMode = "Manual"
+
+	// RecoveryModeAutomatic uses upstream litestream restore flags
+	// (-if-db-not-exists, -if-replica-exists) with integrity checking.
+	// Any genuine restore failure blocks pod startup.
+	RecoveryModeAutomatic RecoveryMode = "Automatic"
+)
+
+// RecoverySpec configures how the operator handles database recovery
+// on pod startup when local state is missing or inconsistent.
+type RecoverySpec struct {
+	// Mode controls the recovery strategy.
+	// Manual (default): blocks startup if inconsistent, requiring explicit LitestreamRestore.
+	// Automatic: runs litestream restore with upstream idempotent flags and integrity check.
+	// +kubebuilder:default=Manual
+	Mode RecoveryMode `json:"mode,omitempty"`
+}
+
+// BootstrapSpec defines SQL to execute when a database is created for the
+// first time. The SQL runs ONLY when no local database file exists AND no
+// remote archive is available — i.e., genuinely new databases.
+type BootstrapSpec struct {
+	// SQL contains one or more SQL statements to execute against the database
+	// when it is genuinely new. Use IF NOT EXISTS guards for safety.
+	SQL string `json:"sql,omitempty"`
+
+	// Image is the container image used for the bootstrap init container.
+	// Must include the sqlite3 CLI.
+	// +kubebuilder:default="keinos/sqlite3:latest"
+	Image string `json:"image,omitempty"`
 }
 
 // LitestreamReplicaSpec defines the desired state of LitestreamReplica.
@@ -128,20 +155,17 @@ type LitestreamReplicaSpec struct {
 	// Backup defines the Litestream replication / backup configuration.
 	Backup BackupSpec `json:"backup,omitempty"`
 
-	// InitSQL contains one or more SQL statements to execute against the
-	// database on first use. The operator tracks a SHA-256 hash of this
-	// content; the statements are (re-)applied only when the hash changes,
-	// making updates idempotent across pod restarts.
-	// Use IF NOT EXISTS guards to make individual statements safe to re-run.
-	InitSQL string `json:"initSQL,omitempty"`
+	// Recovery configures startup recovery behavior when the local database
+	// is missing or inconsistent with the remote archive.
+	Recovery RecoverySpec `json:"recovery,omitempty"`
 
-	// InitImage is the container image used for the init container that
-	// applies InitSQL. Must include the sqlite3 CLI.
-	// +kubebuilder:default="keinos/sqlite3:latest"
-	InitImage string `json:"initImage,omitempty"`
+	// Bootstrap defines SQL to execute only when the database is genuinely new
+	// (no local DB file AND no remote archive). Applications should own schema
+	// migrations after bootstrap.
+	Bootstrap BootstrapSpec `json:"bootstrap,omitempty"`
 
 	// RunAsUser sets the UID for Litestream-managed init containers injected by the
-	// webhook (archive-check, auto-restore, db-init). When set, restored database files
+	// webhook (archive-check, auto-restore, bootstrap). When set, restored database files
 	// are owned by this UID, allowing non-root application containers to read them.
 	// When omitted, the container image's default user (root for litestream) is used.
 	// +optional
@@ -178,30 +202,35 @@ const (
 
 // Condition type constants.
 const (
-	// ConditionSidecarInjected indicates the Litestream sidecar has been
-	// injected into the target Deployment's pod template.
-	ConditionSidecarInjected = "SidecarInjected"
+	// ConditionTargetReady indicates the target workload exists and is valid.
+	ConditionTargetReady = "TargetReady"
 
-	// ConditionBackupHealthy indicates the most recent backup succeeded.
-	ConditionBackupHealthy = "BackupHealthy"
+	// ConditionSidecarReady indicates the Litestream sidecar is injected and running.
+	ConditionSidecarReady = "SidecarReady"
 
-	// ConditionInitSQLApplied indicates the InitSQL has been configured and
-	// the init container is ready to apply it on next pod start.
-	ConditionInitSQLApplied = "InitSQLApplied"
+	// ConditionReplicationHealthy indicates active, healthy replication.
+	ConditionReplicationHealthy = "ReplicationHealthy"
+
+	// ConditionRecoverySafe indicates no archive mismatch detected at startup.
+	// True = safe, False = mismatch detected (blocks startup).
+	ConditionRecoverySafe = "RecoverySafe"
+
+	// ConditionBootstrapApplied indicates bootstrap SQL has been configured and
+	// the init container is ready to apply it when the database is genuinely new.
+	ConditionBootstrapApplied = "BootstrapApplied"
 
 	// ConditionReplicationPaused indicates that Litestream replication has been
 	// intentionally paused via the AnnotationPause annotation.
 	ConditionReplicationPaused = "ReplicationPaused"
 
-	// ConditionArchiveCheckFailed indicates that the archive-check init container
-	// detected a mismatch: the local DB is missing but S3 has existing backup data.
-	// The pod is blocked from starting until a LitestreamRestore resolves the state.
-	ConditionArchiveCheckFailed = "ArchiveCheckFailed"
-
 	// ConditionReplicaCountExceeded indicates that the target workload has more
 	// than one replica. Litestream requires exactly one writer to avoid database
 	// corruption from concurrent writes.
 	ConditionReplicaCountExceeded = "ReplicaCountExceeded"
+
+	// ConditionUnsafeRolloutStrategy indicates the target Deployment uses a rollout
+	// strategy that can temporarily run two pods, risking concurrent SQLite writers.
+	ConditionUnsafeRolloutStrategy = "UnsafeRolloutStrategy"
 
 	// ConditionReady is the top-level readiness condition.
 	ConditionReady = "Ready"
@@ -233,10 +262,9 @@ type LitestreamReplicaStatus struct {
 	// ReplicationLag is the approximate lag reported by Litestream (human-readable).
 	ReplicationLag string `json:"replicationLag,omitempty"`
 
-	// InitSQLHash is the SHA-256 hash of the InitSQL currently configured in
-	// the spec. The init container uses this to name its marker file, so a
-	// hash change triggers re-application on next pod rollout.
-	InitSQLHash string `json:"initSQLHash,omitempty"`
+	// InjectedSpecHash is the hash of the injection-relevant spec fields currently
+	// applied to the target workload's pod template.
+	InjectedSpecHash string `json:"injectedSpecHash,omitempty"`
 
 	// ObservedGeneration is the .metadata.generation this status was computed from.
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`

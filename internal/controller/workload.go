@@ -192,6 +192,29 @@ func (r *LitestreamRestoreReconciler) getTargetWorkloadForRestore(ctx context.Co
 	return &workloadTarget{deployment: dep}, nil
 }
 
+// removeWorkloadAnnotations removes operator-owned injection annotations and labels
+// from the target workload's pod template during finalization.
+func (r *LitestreamReplicaReconciler) removeWorkloadAnnotations(ctx context.Context, wt *workloadTarget) error {
+	if wt.deployment != nil {
+		dep := wt.deployment
+		patch := client.MergeFrom(dep.DeepCopy())
+		delete(dep.Spec.Template.Annotations, injectAnnotation)
+		delete(dep.Spec.Template.Annotations, configAnnotation)
+		delete(dep.Spec.Template.Annotations, skipArchiveAnnotation)
+		delete(dep.Spec.Template.Annotations, injectionSpecHashAnnotation)
+		delete(dep.Spec.Template.Labels, injectAnnotation)
+		return r.Patch(ctx, dep, patch)
+	}
+	ss := wt.statefulSet
+	patch := client.MergeFrom(ss.DeepCopy())
+	delete(ss.Spec.Template.Annotations, injectAnnotation)
+	delete(ss.Spec.Template.Annotations, configAnnotation)
+	delete(ss.Spec.Template.Annotations, skipArchiveAnnotation)
+	delete(ss.Spec.Template.Annotations, injectionSpecHashAnnotation)
+	delete(ss.Spec.Template.Labels, injectAnnotation)
+	return r.Patch(ctx, ss, patch)
+}
+
 // scaleWorkload patches the replica count of the target workload.
 func (r *LitestreamRestoreReconciler) scaleWorkload(ctx context.Context, wt *workloadTarget, replicas int32) error {
 	if wt.deployment != nil {

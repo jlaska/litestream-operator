@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	databasev1 "github.com/jlaska/litestream-operator/api/v1"
@@ -86,23 +87,57 @@ var _ = Describe("LitestreamRestore Controller", func() {
 		return &databasev1.LitestreamRestore{
 			ObjectMeta: metav1.ObjectMeta{Name: restoreName, Namespace: namespaceName},
 			Spec: databasev1.LitestreamRestoreSpec{
-				SourceRef:  sourceDBName,
-				TargetPVC:  targetPVC,
-				TargetPath: targetPath,
+				SourceRef: databasev1.RestoreSourceRef{Name: sourceDBName},
+				Mode:      databasev1.RestoreModeToPVC,
+				Target: &databasev1.RestoreTarget{
+					PVC:  targetPVC,
+					Path: targetPath,
+				},
 			},
 		}
 	}
 
-	// positionAtScalingDown pre-positions the given restore at ScalingDown phase with
-	// the Deployment status.replicas=0, so the next reconcile creates the restore Job.
-	positionAtScalingDown := func(rKey types.NamespacedName) {
+	// positionAtFencing pre-positions the given restore at Fencing phase with
+	// the Deployment status.replicas=0, pause annotation set, ConfigMap paused,
+	// and finalizer present, so the next reconcile creates the restore Job.
+	positionAtFencing := func(rKey types.NamespacedName) {
 		replicas := int32(1)
 		r := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, rKey, r)).To(Succeed())
+
+		// Add finalizer so reconcile doesn't short-circuit to add it.
+		if !controllerutil.ContainsFinalizer(r, "litestream.io/restore-finalizer") {
+			controllerutil.AddFinalizer(r, "litestream.io/restore-finalizer")
+			Expect(k8sClient.Update(ctx, r)).To(Succeed())
+			Expect(k8sClient.Get(ctx, rKey, r)).To(Succeed())
+		}
+
 		patch := client.MergeFrom(r.DeepCopy())
-		r.Status.Phase = databasev1.RestorePhaseScalingDown
+		r.Status.Phase = databasev1.RestorePhaseFencing
 		r.Status.OriginalReplicas = &replicas
+		r.Status.ResolvedPVC = targetPVC
+		r.Status.ResolvedPath = targetPath
 		Expect(k8sClient.Status().Patch(ctx, r, patch)).To(Succeed())
+
+		// Set pause annotation on the source DB.
+		Eventually(func() error {
+			db := &databasev1.LitestreamReplica{}
+			if err := k8sClient.Get(ctx, sourceDBKey, db); err != nil {
+				return err
+			}
+			if db.Annotations == nil {
+				db.Annotations = map[string]string{}
+			}
+			db.Annotations[databasev1.AnnotationPause] = "true"
+			return k8sClient.Update(ctx, db)
+		}).Should(Succeed())
+
+		// Wait for the ConfigMap to reflect pause (background controller does this).
+		Eventually(func(g Gomega) {
+			cm := &corev1.ConfigMap{}
+			g.Expect(k8sClient.Get(ctx, sourceConfigMapKey, cm)).To(Succeed())
+			g.Expect(cm.Data["litestream.yml"]).To(Equal("dbs: []\n"))
+		}).Should(Succeed())
 
 		dep := &appsv1.Deployment{}
 		Expect(k8sClient.Get(ctx, sourceDepKey, dep)).To(Succeed())
@@ -159,7 +194,7 @@ var _ = Describe("LitestreamRestore Controller", func() {
 		}
 
 		// Explicitly delete ConfigMaps — envtest does not GC owned objects.
-		for _, cmName := range []string{sourceDBName + "-litestream", sourceDBName + "-init-sql"} {
+		for _, cmName := range []string{sourceDBName + "-litestream", sourceDBName + "-bootstrap-sql"} {
 			cm := &corev1.ConfigMap{}
 			if err := k8sClient.Get(ctx, types.NamespacedName{Name: cmName, Namespace: namespaceName}, cm); err == nil {
 				_ = k8sClient.Delete(ctx, cm)
@@ -181,7 +216,7 @@ var _ = Describe("LitestreamRestore Controller", func() {
 	})
 
 	It("creates a restore Job with correct args and env vars", func() {
-		positionAtScalingDown(restoreKey)
+		positionAtFencing(restoreKey)
 		_, err := newRestoreReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -218,7 +253,7 @@ var _ = Describe("LitestreamRestore Controller", func() {
 	})
 
 	It("mounts the target PVC at the parent directory of TargetPath", func() {
-		positionAtScalingDown(restoreKey)
+		positionAtFencing(restoreKey)
 		_, err := newRestoreReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -264,10 +299,13 @@ var _ = Describe("LitestreamRestore Controller", func() {
 		pitrRestore := &databasev1.LitestreamRestore{
 			ObjectMeta: metav1.ObjectMeta{Name: pitrRestoreName, Namespace: namespaceName},
 			Spec: databasev1.LitestreamRestoreSpec{
-				SourceRef:  sourceDBName,
-				TargetPVC:  targetPVC,
-				TargetPath: targetPath,
-				Timestamp:  "2026-06-17T10:00:00Z",
+				SourceRef: databasev1.RestoreSourceRef{Name: sourceDBName},
+				Mode:      databasev1.RestoreModeToPVC,
+				Target: &databasev1.RestoreTarget{
+					PVC:  targetPVC,
+					Path: targetPath,
+				},
+				Timestamp: "2026-06-17T10:00:00Z",
 			},
 		}
 		Expect(k8sClient.Create(ctx, pitrRestore)).To(Succeed())
@@ -281,7 +319,7 @@ var _ = Describe("LitestreamRestore Controller", func() {
 			}
 		}()
 
-		positionAtScalingDown(pitrKey)
+		positionAtFencing(pitrKey)
 		_, err := newRestoreReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: pitrKey})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -295,22 +333,22 @@ var _ = Describe("LitestreamRestore Controller", func() {
 		Expect(args).To(ContainElements("-timestamp", "2026-06-17T10:00:00Z"))
 	})
 
-	It("sets status to Running after creating the Job", func() {
-		positionAtScalingDown(restoreKey)
+	It("sets status to Restoring after creating the Job", func() {
+		positionAtFencing(restoreKey)
 		_, err := newRestoreReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		restore := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseRunning))
+		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseRestoring))
 		Expect(restore.Status.JobName).To(Equal(restoreName + "-restore"))
 	})
 
 	It("is idempotent — does not create a second Job on re-reconcile", func() {
-		positionAtScalingDown(restoreKey)
+		positionAtFencing(restoreKey)
 		reconciler := newRestoreReconciler()
 
-		// First reconcile: ScalingDown → Running (creates Job).
+		// First reconcile: Fencing → Restoring (creates Job).
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -345,17 +383,26 @@ var _ = Describe("LitestreamRestore Controller", func() {
 		badRestore := &databasev1.LitestreamRestore{
 			ObjectMeta: metav1.ObjectMeta{Name: badRestoreName, Namespace: namespaceName},
 			Spec: databasev1.LitestreamRestoreSpec{
-				SourceRef:  "no-backup-db",
-				TargetPVC:  targetPVC,
-				TargetPath: targetPath,
+				SourceRef: databasev1.RestoreSourceRef{Name: "no-backup-db"},
+				Mode:      databasev1.RestoreModeToPVC,
+				Target: &databasev1.RestoreTarget{
+					PVC:  targetPVC,
+					Path: targetPath,
+				},
 			},
 		}
 		Expect(k8sClient.Create(ctx, badRestore)).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, badRestore) }()
 
-		_, err := newRestoreReconciler().Reconcile(ctx, reconcile.Request{
-			NamespacedName: types.NamespacedName{Name: badRestoreName, Namespace: namespaceName},
-		})
+		reconciler := newRestoreReconciler()
+		reqKey := reconcile.Request{NamespacedName: types.NamespacedName{Name: badRestoreName, Namespace: namespaceName}}
+
+		// First reconcile adds the finalizer.
+		_, err := reconciler.Reconcile(ctx, reqKey)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Second reconcile detects backup disabled and fails.
+		_, err = reconciler.Reconcile(ctx, reqKey)
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: badRestoreName, Namespace: namespaceName}, badRestore)).To(Succeed())
@@ -406,7 +453,21 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 				Template: corev1.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": depName}},
 					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{{Name: "app", Image: "busybox"}},
+						Containers: []corev1.Container{{
+							Name:  "app",
+							Image: "busybox",
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "data", MountPath: "/data"},
+							},
+						}},
+						Volumes: []corev1.Volume{{
+							Name: "data",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: targetPVC,
+								},
+							},
+						}},
 					},
 				},
 			},
@@ -443,9 +504,7 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		restore := &databasev1.LitestreamRestore{
 			ObjectMeta: metav1.ObjectMeta{Name: restoreName, Namespace: namespaceName},
 			Spec: databasev1.LitestreamRestoreSpec{
-				SourceRef:  dbName,
-				TargetPVC:  targetPVC,
-				TargetPath: targetPath,
+				SourceRef: databasev1.RestoreSourceRef{Name: dbName},
 			},
 		}
 		Expect(k8sClient.Create(ctx, restore)).To(Succeed())
@@ -463,7 +522,7 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 			_ = k8sClient.Delete(ctx, db)
 		}
 		// Explicitly delete ConfigMaps — envtest does not GC owned objects.
-		for _, suffix := range []string{"-litestream", "-init-sql"} {
+		for _, suffix := range []string{"-litestream", "-bootstrap-sql"} {
 			cm := &corev1.ConfigMap{}
 			if err := k8sClient.Get(ctx, types.NamespacedName{
 				Name: dbKey.Name + suffix, Namespace: namespaceName,
@@ -491,23 +550,34 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		}
 	}
 
-	It("sets pause annotation on LitestreamReplica and transitions to Pausing", func() {
+	It("transitions to AcquiringLock and then sets pause annotation", func() {
 		dbKey, restoreKey, deployKey := newStateMachineResources("pause-pending", 1)
 		defer cleanupResources(dbKey, restoreKey, deployKey)
 
 		reconciler := newReconciler()
+
+		// Adds finalizer.
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
-		// LitestreamReplica should now have the pause annotation.
+		// Pending → AcquiringLock.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		restore := &databasev1.LitestreamRestore{}
+		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
+		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseAcquiringLock))
+
+		// AcquiringLock → Fencing (sets pause annotation).
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
 		db := &databasev1.LitestreamReplica{}
 		Expect(k8sClient.Get(ctx, dbKey, db)).To(Succeed())
 		Expect(db.Annotations[databasev1.AnnotationPause]).To(Equal("true"))
 
-		// Restore should be in Pausing phase.
-		restore := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhasePausing))
+		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseFencing))
 	})
 
 	It("records originalReplicas in status during Pending phase", func() {
@@ -515,7 +585,14 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		dbKey, restoreKey, deployKey := newStateMachineResources("orig-replicas", replicas)
 		defer cleanupResources(dbKey, restoreKey, deployKey)
 
-		_, err := newReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		reconciler := newReconciler()
+
+		// Adds finalizer.
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Pending → AcquiringLock (records originalReplicas).
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		restore := &databasev1.LitestreamRestore{}
@@ -524,14 +601,29 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		Expect(*restore.Status.OriginalReplicas).To(Equal(replicas))
 	})
 
-	It("scales Deployment to 0 when ConfigMap reflects pause (Pausing → ScalingDown)", func() {
+	It("scales Deployment to 0 when ConfigMap reflects pause (AcquiringLock → Fencing)", func() {
 		dbKey, restoreKey, deployKey := newStateMachineResources("scale-down", 1)
 		defer cleanupResources(dbKey, restoreKey, deployKey)
 
 		reconciler := newReconciler()
 
-		// Pending → Pausing.
+		// Simulate Deployment having 1 running pod.
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, deployKey, dep)).To(Succeed())
+		depStatusPatch := client.MergeFrom(dep.DeepCopy())
+		dep.Status.Replicas = 1
+		Expect(k8sClient.Status().Patch(ctx, dep, depStatusPatch)).To(Succeed())
+
+		// Adds finalizer.
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Pending → AcquiringLock.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// AcquiringLock → Fencing (sets pause annotation).
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		// Simulate controller reconciling the LitestreamReplica and updating the ConfigMap.
@@ -546,28 +638,38 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		cm.Data["litestream.yml"] = "dbs: []\n"
 		Expect(k8sClient.Patch(ctx, cm, cmPatch)).To(Succeed())
 
-		// Pausing → ScalingDown.
+		// Fencing → scales to 0.
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
-		restore := &databasev1.LitestreamRestore{}
-		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseScalingDown))
-
-		dep := &appsv1.Deployment{}
 		Expect(k8sClient.Get(ctx, deployKey, dep)).To(Succeed())
 		Expect(dep.Spec.Replicas).NotTo(BeNil())
 		Expect(*dep.Spec.Replicas).To(BeZero())
 	})
 
-	It("waits in ScalingDown while Deployment still has running replicas", func() {
+	It("waits in Fencing while Deployment still has running replicas", func() {
 		dbKey, restoreKey, deployKey := newStateMachineResources("wait-drain", 1)
 		defer cleanupResources(dbKey, restoreKey, deployKey)
 
 		reconciler := newReconciler()
 
-		// Drive to Pausing.
+		// Simulate Deployment having 1 running pod.
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, deployKey, dep)).To(Succeed())
+		depStatusPatch := client.MergeFrom(dep.DeepCopy())
+		dep.Status.Replicas = 1
+		Expect(k8sClient.Status().Patch(ctx, dep, depStatusPatch)).To(Succeed())
+
+		// Adds finalizer.
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Pending → AcquiringLock.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// AcquiringLock → Fencing (sets pause annotation).
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		// Update ConfigMap to reflect pause.
@@ -582,28 +684,29 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		cm.Data["litestream.yml"] = "dbs: []\n"
 		Expect(k8sClient.Patch(ctx, cm, cmPatch)).To(Succeed())
 
-		// Drive to ScalingDown.
+		// Fencing reconcile — scales spec to 0 but status.replicas still 1.
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		restore := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseScalingDown))
+		// Phase stays Fencing because status.replicas > 0 (waiting for pods to drain).
+		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseFencing))
 
 		// Simulate Deployment still draining (status.replicas = 1).
-		dep := &appsv1.Deployment{}
+		dep = &appsv1.Deployment{}
 		Expect(k8sClient.Get(ctx, deployKey, dep)).To(Succeed())
-		depStatusPatch := client.MergeFrom(dep.DeepCopy())
+		depStatusPatch2 := client.MergeFrom(dep.DeepCopy())
 		dep.Status.Replicas = 1
-		Expect(k8sClient.Status().Patch(ctx, dep, depStatusPatch)).To(Succeed())
+		Expect(k8sClient.Status().Patch(ctx, dep, depStatusPatch2)).To(Succeed())
 
-		// Reconcile should still be in ScalingDown.
+		// Reconcile should still be in Fencing.
 		result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result.RequeueAfter).To(Equal(restoreRequeueInterval))
 
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseScalingDown))
+		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseFencing))
 		// Job should NOT exist yet.
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{
@@ -611,14 +714,22 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		}, job)).To(MatchError(ContainSubstring("not found")))
 	})
 
-	It("creates Job and transitions to Running once Deployment reaches 0 replicas", func() {
+	It("creates Job and transitions to Restoring once Deployment reaches 0 replicas", func() {
 		dbKey, restoreKey, deployKey := newStateMachineResources("create-job", 1)
 		defer cleanupResources(dbKey, restoreKey, deployKey)
 
 		reconciler := newReconciler()
 
-		// Drive to Pausing.
+		// First reconcile adds the finalizer.
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Pending → AcquiringLock.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// AcquiringLock → Fencing.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		// Update ConfigMap.
@@ -633,7 +744,7 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		cm.Data["litestream.yml"] = "dbs: []\n"
 		Expect(k8sClient.Patch(ctx, cm, cmPatch)).To(Succeed())
 
-		// Drive to ScalingDown.
+		// Drive to Fencing.
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -644,13 +755,13 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		dep.Status.Replicas = 0
 		Expect(k8sClient.Status().Patch(ctx, dep, depStatusPatch)).To(Succeed())
 
-		// ScalingDown → Running.
+		// Fencing → Restoring.
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		restore := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseRunning))
+		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseRestoring))
 
 		// Job should exist.
 		job := &batchv1.Job{}
@@ -659,16 +770,16 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		}, job)).To(Succeed())
 	})
 
-	It("transitions to Validating when restore Job succeeds", func() { //nolint:dupl
+	It("transitions to Resuming when restore Job succeeds (InPlace)", func() {
 		dbKey, restoreKey, deployKey := newStateMachineResources("job-complete", 1)
 		defer cleanupResources(dbKey, restoreKey, deployKey)
 
 		reconciler := newReconciler()
 
-		// Drive to Running.
+		// Drive to Restoring.
 		driveToRunning(ctx, reconciler, dbKey, restoreKey, deployKey)
 
-		// Simulate restore Job success.
+		// Simulate restore Job success (integrity check is native via -integrity-check flag).
 		jobKey := types.NamespacedName{Name: restoreKey.Name + "-restore", Namespace: namespaceName}
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, jobKey, job)).To(Succeed())
@@ -687,69 +798,8 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 
 		restore := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		// Running → Validating (integrity check phase inserted between Running and ScalingUp).
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseValidating))
-	})
-
-	It("transitions to ScalingUp when validation Job succeeds", func() { //nolint:dupl
-		dbKey, restoreKey, deployKey := newStateMachineResources("validate-pass", 1)
-		defer cleanupResources(dbKey, restoreKey, deployKey)
-
-		reconciler := newReconciler()
-		driveToValidating(ctx, reconciler, dbKey, restoreKey, deployKey)
-
-		// Simulate validation Job success.
-		validateJobKey := types.NamespacedName{Name: restoreKey.Name + "-validate", Namespace: namespaceName}
-		validateJob := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, validateJobKey, validateJob)).To(Succeed())
-		now := metav1.Now()
-		vpatch := client.MergeFrom(validateJob.DeepCopy())
-		validateJob.Status.StartTime = &now
-		validateJob.Status.CompletionTime = &now
-		validateJob.Status.Conditions = []batchv1.JobCondition{
-			{Type: batchv1.JobSuccessCriteriaMet, Status: corev1.ConditionTrue, LastProbeTime: now, LastTransitionTime: now},
-			{Type: batchv1.JobComplete, Status: corev1.ConditionTrue, LastProbeTime: now, LastTransitionTime: now},
-		}
-		Expect(k8sClient.Status().Patch(ctx, validateJob, vpatch)).To(Succeed())
-
-		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
-		Expect(err).NotTo(HaveOccurred())
-
-		restore := &databasev1.LitestreamRestore{}
-		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseScalingUp))
-	})
-
-	It("transitions to Failed when validation Job fails (integrity check failure)", func() {
-		dbKey, restoreKey, deployKey := newStateMachineResources("validate-fail", 1)
-		defer cleanupResources(dbKey, restoreKey, deployKey)
-
-		reconciler := newReconciler()
-		driveToValidating(ctx, reconciler, dbKey, restoreKey, deployKey)
-
-		// Simulate validation Job failure (integrity check returned non-zero).
-		// Kubernetes 1.31+ requires FailureTarget=True before Failed=True and startTime.
-		validateJobKey := types.NamespacedName{Name: restoreKey.Name + "-validate", Namespace: namespaceName}
-		validateJob := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, validateJobKey, validateJob)).To(Succeed())
-		now := metav1.Now()
-		vpatch := client.MergeFrom(validateJob.DeepCopy())
-		validateJob.Status.StartTime = &now
-		validateJob.Status.Conditions = []batchv1.JobCondition{
-			{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue,
-				Message: "db integrity check failed", LastProbeTime: now, LastTransitionTime: now},
-			{Type: batchv1.JobFailed, Status: corev1.ConditionTrue,
-				Message: "db integrity check failed", LastProbeTime: now, LastTransitionTime: now},
-		}
-		Expect(k8sClient.Status().Patch(ctx, validateJob, vpatch)).To(Succeed())
-
-		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
-		Expect(err).NotTo(HaveOccurred())
-
-		restore := &databasev1.LitestreamRestore{}
-		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseFailed))
-		Expect(restore.Status.Message).To(ContainSubstring("integrity check failed"))
+		// Restoring → Resuming (no separate validation phase; integrity check is native).
+		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseResuming))
 	})
 
 	It("scales Deployment back to originalReplicas and transitions to Complete", func() {
@@ -757,15 +807,10 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		defer cleanupResources(dbKey, restoreKey, deployKey)
 
 		reconciler := newReconciler()
-		// Drive through Running → Validating → ScalingUp.
-		driveToValidating(ctx, reconciler, dbKey, restoreKey, deployKey)
-		simulateValidationSuccess(ctx, restoreKey)
+		// Drive through Restoring → Resuming.
+		driveToResuming(ctx, reconciler, dbKey, restoreKey, deployKey)
 
-		// Validating → ScalingUp.
-		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
-		Expect(err).NotTo(HaveOccurred())
-
-		// ScalingUp → Complete: retry until the background LitestreamReplica controller
+		// Resuming → Completed: retry until the background LitestreamReplica controller
 		// updates the ConfigMap to the full config (after cache propagation of the pause
 		// annotation removal). Each Reconcile is idempotent until the CM is updated.
 		Eventually(func(g Gomega) {
@@ -773,7 +818,7 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 			g.Expect(reconcileErr).NotTo(HaveOccurred())
 			r := &databasev1.LitestreamRestore{}
 			g.Expect(k8sClient.Get(ctx, restoreKey, r)).To(Succeed())
-			g.Expect(r.Status.Phase).To(Equal(databasev1.RestorePhaseComplete))
+			g.Expect(r.Status.Phase).To(Equal(databasev1.RestorePhaseCompleted))
 		}, 10*time.Second, 100*time.Millisecond).Should(Succeed())
 
 		// Deployment should be scaled back to originalReplicas.
@@ -788,15 +833,10 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		defer cleanupResources(dbKey, restoreKey, deployKey)
 
 		reconciler := newReconciler()
-		driveToValidating(ctx, reconciler, dbKey, restoreKey, deployKey)
-		simulateValidationSuccess(ctx, restoreKey)
+		driveToResuming(ctx, reconciler, dbKey, restoreKey, deployKey)
 
-		// Two reconciles needed: first transitions Validating → ScalingUp (sets phase),
-		// second calls reconcileScalingUp which removes the pause annotation before the
-		// ConfigMap check (steps 1 and 2 run regardless of CM state).
+		// Resuming reconcile removes the pause annotation before the ConfigMap check.
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
-		Expect(err).NotTo(HaveOccurred())
-		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		// Pause annotation should be removed from LitestreamReplica.
@@ -810,15 +850,10 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		defer cleanupResources(dbKey, restoreKey, deployKey)
 
 		reconciler := newReconciler()
-		driveToValidating(ctx, reconciler, dbKey, restoreKey, deployKey)
-		simulateValidationSuccess(ctx, restoreKey)
+		driveToResuming(ctx, reconciler, dbKey, restoreKey, deployKey)
 
-		// Two reconciles needed: first transitions Validating → ScalingUp (sets phase),
-		// second calls reconcileScalingUp which sets skip-archive-check before the
-		// ConfigMap check (step 1 runs regardless of CM state).
+		// Resuming reconcile sets skip-archive-check before the ConfigMap check.
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
-		Expect(err).NotTo(HaveOccurred())
-		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		// skip-archive-check must be set on the LitestreamReplica so that the
@@ -830,7 +865,7 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 			"restore controller must set skip-archive-check to prevent false-positive archive-check on next pod start")
 	})
 
-	It("cleans up on Job failure: scales back up and removes pause annotation", func() {
+	It("leaves workload fenced on Job failure and removes pause annotation", func() {
 		dbKey, restoreKey, deployKey := newStateMachineResources("fail-cleanup", 1)
 		defer cleanupResources(dbKey, restoreKey, deployKey)
 
@@ -857,17 +892,18 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		restore := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
 		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseFailed))
+		Expect(restore.Status.Message).To(ContainSubstring("APPLICATION IS FENCED"))
 
 		// Pause annotation should be removed.
 		db := &databasev1.LitestreamReplica{}
 		Expect(k8sClient.Get(ctx, dbKey, db)).To(Succeed())
 		Expect(db.Annotations[databasev1.AnnotationPause]).NotTo(Equal("true"))
 
-		// Deployment should be scaled back up.
+		// Workload must remain fenced (replicas=0) — do NOT scale back up.
 		dep := &appsv1.Deployment{}
 		Expect(k8sClient.Get(ctx, deployKey, dep)).To(Succeed())
 		Expect(dep.Spec.Replicas).NotTo(BeNil())
-		Expect(*dep.Spec.Replicas).To(Equal(int32(1)))
+		Expect(*dep.Spec.Replicas).To(Equal(int32(0)))
 	})
 
 	It("is a no-op for Complete phase", func() {
@@ -878,10 +914,17 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		restore := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
 		patch := client.MergeFrom(restore.DeepCopy())
-		restore.Status.Phase = databasev1.RestorePhaseComplete
+		restore.Status.Phase = databasev1.RestorePhaseCompleted
 		Expect(k8sClient.Status().Patch(ctx, restore, patch)).To(Succeed())
 
-		_, err := newReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		reconciler := newReconciler()
+
+		// Adds finalizer.
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// No-op — terminal phase.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		// LitestreamReplica should NOT have pause annotation.
@@ -900,7 +943,14 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		restore.Status.Phase = databasev1.RestorePhaseFailed
 		Expect(k8sClient.Status().Patch(ctx, restore, patch)).To(Succeed())
 
-		_, err := newReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		reconciler := newReconciler()
+
+		// Adds finalizer.
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// No-op — terminal phase.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		// Phase stays Failed — no further reconciliation.
@@ -927,21 +977,16 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		_ = deployKey
 	})
 
-	It("reconcileScalingUp with OriginalReplicas=0 skips scale-up and completes", func() {
+	It("reconcileResuming with OriginalReplicas=0 skips scale-up and completes", func() {
 		dbKey, restoreKey, deployKey := newStateMachineResources("scale-up-zero-replicas", 1)
 		defer cleanupResources(dbKey, restoreKey, deployKey)
 
 		reconciler := newReconciler()
-		driveToValidating(ctx, reconciler, dbKey, restoreKey, deployKey)
-		simulateValidationSuccess(ctx, restoreKey)
-
-		// Validating → ScalingUp.
-		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
-		Expect(err).NotTo(HaveOccurred())
+		driveToResuming(ctx, reconciler, dbKey, restoreKey, deployKey)
 
 		restore := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseScalingUp))
+		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseResuming))
 
 		// Set OriginalReplicas to 0 — app was already stopped before restore.
 		zeroReplicas := int32(0)
@@ -949,14 +994,14 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		restore.Status.OriginalReplicas = &zeroReplicas
 		Expect(k8sClient.Status().Patch(ctx, restore, patch)).To(Succeed())
 
-		// ScalingUp with target=0 → skip scale-up, just resume and complete. Retry until
+		// Resuming with target=0 → skip scale-up, just resume and complete. Retry until
 		// the LitestreamReplica controller updates the ConfigMap (cache propagation).
 		Eventually(func(g Gomega) {
 			_, reconcileErr := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 			g.Expect(reconcileErr).NotTo(HaveOccurred())
 			r := &databasev1.LitestreamRestore{}
 			g.Expect(k8sClient.Get(ctx, restoreKey, r)).To(Succeed())
-			g.Expect(r.Status.Phase).To(Equal(databasev1.RestorePhaseComplete))
+			g.Expect(r.Status.Phase).To(Equal(databasev1.RestorePhaseCompleted))
 		}, 10*time.Second, 100*time.Millisecond).Should(Succeed())
 		_ = dbKey
 		_ = deployKey
@@ -973,7 +1018,14 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		dep.Spec.Replicas = nil
 		Expect(k8sClient.Patch(ctx, dep, depPatch)).To(Succeed())
 
-		_, err := newReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		reconciler := newReconciler()
+
+		// Adds finalizer.
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Pending → AcquiringLock.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		restore := &databasev1.LitestreamRestore{}
@@ -1023,9 +1075,12 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		restore := &databasev1.LitestreamRestore{
 			ObjectMeta: metav1.ObjectMeta{Name: restoreName, Namespace: namespaceName},
 			Spec: databasev1.LitestreamRestoreSpec{
-				SourceRef:  dbName,
-				TargetPVC:  targetPVC,
-				TargetPath: targetPath,
+				SourceRef: databasev1.RestoreSourceRef{Name: dbName},
+				Mode:      databasev1.RestoreModeToPVC,
+				Target: &databasev1.RestoreTarget{
+					PVC:  targetPVC,
+					Path: targetPath,
+				},
 			},
 		}
 		Expect(k8sClient.Create(ctx, restore)).To(Succeed())
@@ -1039,32 +1094,17 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		}()
 
 		reconciler := newReconciler()
+		reqKey := reconcile.Request{NamespacedName: types.NamespacedName{Name: restoreName, Namespace: namespaceName}}
 
-		// Pending → Pausing (deployment not found → originalReplicas=0)
-		_, err := reconciler.Reconcile(ctx, reconcile.Request{
-			NamespacedName: types.NamespacedName{Name: restoreName, Namespace: namespaceName},
-		})
+		// First reconcile adds the finalizer.
+		_, err := reconciler.Reconcile(ctx, reqKey)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Pending → Restoring directly (ToPVC mode skips workload fencing)
+		_, err = reconciler.Reconcile(ctx, reqKey)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: restoreName, Namespace: namespaceName}, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhasePausing))
-		Expect(restore.Status.OriginalReplicas).NotTo(BeNil())
-		Expect(*restore.Status.OriginalReplicas).To(Equal(int32(0)))
-
-		// Pausing → ScalingDown (deployment not found → skip scale, go straight to ScalingDown)
-		_, err = reconciler.Reconcile(ctx, reconcile.Request{
-			NamespacedName: types.NamespacedName{Name: restoreName, Namespace: namespaceName},
-		})
-		Expect(err).NotTo(HaveOccurred())
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: restoreName, Namespace: namespaceName}, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseScalingDown))
-
-		// ScalingDown → Running (deployment not found → treat as replicas=0, create Job)
-		_, err = reconciler.Reconcile(ctx, reconcile.Request{
-			NamespacedName: types.NamespacedName{Name: restoreName, Namespace: namespaceName},
-		})
-		Expect(err).NotTo(HaveOccurred())
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: restoreName, Namespace: namespaceName}, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseRunning))
+		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseRestoring))
 
 		// Job should exist.
 		job := &batchv1.Job{}
@@ -1075,19 +1115,23 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 	})
 
 	// ── R1 ──────────────────────────────────────────────────────────────────
-	It("reconcilePausing re-sets pause annotation if it was removed", func() {
+	It("reconcileFencing re-sets pause annotation if it was removed", func() {
 		dbKey, restoreKey, deployKey := newStateMachineResources("pausing-re-pause", 1)
 		defer cleanupResources(dbKey, restoreKey, deployKey)
 
 		reconciler := newReconciler()
 
-		// Drive to Pausing.
+		// First reconcile adds the finalizer.
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Pending → AcquiringLock.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		restore := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhasePausing))
+		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseAcquiringLock))
 
 		// Remove the pause annotation from the LitestreamReplica (simulates a user mistake).
 		// Use Eventually to handle any 409 conflict from the background reconciler.
@@ -1105,7 +1149,7 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		Expect(k8sClient.Get(ctx, dbKey, db)).To(Succeed())
 		Expect(db.Annotations[databasev1.AnnotationPause]).NotTo(Equal("true"))
 
-		// Reconcile while in Pausing phase with annotation absent — controller re-sets it.
+		// Reconcile while in AcquiringLock phase with annotation absent — controller re-sets it.
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -1116,25 +1160,40 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 	})
 
 	// ── R2 ──────────────────────────────────────────────────────────────────
-	// Tests the full Pausing→ScalingDown transition: once both the pause annotation
+	// Tests the full AcquiringLock→Fencing transition: once both the pause annotation
 	// is set AND the ConfigMap reflects dbs:[], the controller scales down and
-	// transitions to ScalingDown. Exercises the ConfigMap-check path in reconcilePausing.
-	It("reconcilePausing advances to ScalingDown once ConfigMap reflects the pause", func() {
+	// transitions to Fencing. Exercises the ConfigMap-check path in reconcileFencing.
+	It("reconcileFencing scales down once ConfigMap reflects the pause", func() {
 		dbKey, restoreKey, deployKey := newStateMachineResources("pausing-cm-advances", 1)
 		defer cleanupResources(dbKey, restoreKey, deployKey)
 
 		reconciler := newReconciler()
 
-		// Pending → Pausing.
+		// Simulate Deployment having 1 running pod so Fencing actually scales down.
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, deployKey, dep)).To(Succeed())
+		depStatusPatch := client.MergeFrom(dep.DeepCopy())
+		dep.Status.Replicas = 1
+		Expect(k8sClient.Status().Patch(ctx, dep, depStatusPatch)).To(Succeed())
+
+		// Adds finalizer.
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Pending → AcquiringLock.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// AcquiringLock → Fencing (sets pause annotation).
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		restore := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhasePausing))
+		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseFencing))
 
 		// The background LitestreamReplica controller will update the ConfigMap to "dbs: []\n".
-		// Wait for it, then reconcile the restore — it should advance to ScalingDown.
+		// Wait for it, then reconcile the restore — it should scale down.
 		Eventually(func(g Gomega) {
 			cm := &corev1.ConfigMap{}
 			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
@@ -1146,26 +1205,57 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
-		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseScalingDown))
-		_ = deployKey
+		Expect(k8sClient.Get(ctx, deployKey, dep)).To(Succeed())
+		Expect(dep.Spec.Replicas).NotTo(BeNil())
+		Expect(*dep.Spec.Replicas).To(BeZero())
 	})
 
 	// ── R3 ──────────────────────────────────────────────────────────────────
-	It("reconcileScalingDown requeues while deployment still has running pods", func() {
+	It("reconcileFencing requeues while deployment still has running pods", func() {
 		dbKey, restoreKey, deployKey := newStateMachineResources("scaling-down-wait", 1)
 		defer cleanupResources(dbKey, restoreKey, deployKey)
 
 		reconciler := newReconciler()
 
-		// Pre-position at ScalingDown with deployment.Status.Replicas = 1 (still running).
+		// Pre-position at Fencing with deployment.Status.Replicas = 1 (still running).
 		restore := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		patch := client.MergeFrom(restore.DeepCopy())
+
+		// Add finalizer so reconcile doesn't short-circuit to add it.
+		if !controllerutil.ContainsFinalizer(restore, "litestream.io/restore-finalizer") {
+			controllerutil.AddFinalizer(restore, "litestream.io/restore-finalizer")
+			Expect(k8sClient.Update(ctx, restore)).To(Succeed())
+			Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
+		}
+
+		restorePatch := client.MergeFrom(restore.DeepCopy())
 		replicas := int32(1)
-		restore.Status.Phase = databasev1.RestorePhaseScalingDown
+		restore.Status.Phase = databasev1.RestorePhaseFencing
 		restore.Status.OriginalReplicas = &replicas
-		Expect(k8sClient.Status().Patch(ctx, restore, patch)).To(Succeed())
+		restore.Status.ResolvedPVC = targetPVC
+		restore.Status.ResolvedPath = targetPath
+		Expect(k8sClient.Status().Patch(ctx, restore, restorePatch)).To(Succeed())
+
+		// Set pause annotation and paused ConfigMap so Fencing can proceed past those checks.
+		Eventually(func() error {
+			db := &databasev1.LitestreamReplica{}
+			if err := k8sClient.Get(ctx, dbKey, db); err != nil {
+				return err
+			}
+			if db.Annotations == nil {
+				db.Annotations = map[string]string{}
+			}
+			db.Annotations[databasev1.AnnotationPause] = "true"
+			return k8sClient.Update(ctx, db)
+		}).Should(Succeed())
+
+		Eventually(func(g Gomega) {
+			cm := &corev1.ConfigMap{}
+			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: dbKey.Name + "-litestream", Namespace: dbKey.Namespace,
+			}, cm)).To(Succeed())
+			g.Expect(cm.Data["litestream.yml"]).To(Equal("dbs: []\n"))
+		}).Should(Succeed())
 
 		// Keep deployment.Status.Replicas at 1 (not yet scaled down).
 		dep := &appsv1.Deployment{}
@@ -1174,14 +1264,10 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		dep.Status.Replicas = 1
 		Expect(k8sClient.Status().Patch(ctx, dep, depStatusPatch)).To(Succeed())
 
-		// Reconcile — deployment still has pods, should requeue (stay in ScalingDown).
+		// Reconcile — deployment still has pods, should requeue (stay in Fencing).
 		result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
-
-		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseScalingDown))
-		_ = dbKey
 	})
 
 	// ── R4 ──────────────────────────────────────────────────────────────────
@@ -1261,18 +1347,26 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		restore := &databasev1.LitestreamRestore{
 			ObjectMeta: metav1.ObjectMeta{Name: noBackupRestore, Namespace: namespaceName},
 			Spec: databasev1.LitestreamRestoreSpec{
-				SourceRef:  noBackupDB,
-				TargetPVC:  targetPVC,
-				TargetPath: targetPath,
+				SourceRef: databasev1.RestoreSourceRef{Name: noBackupDB},
+				Mode:      databasev1.RestoreModeToPVC,
+				Target: &databasev1.RestoreTarget{
+					PVC:  targetPVC,
+					Path: targetPath,
+				},
 			},
 		}
 		Expect(k8sClient.Create(ctx, restore)).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, restore) }()
 
 		r := newReconciler()
-		_, err := r.Reconcile(ctx, reconcile.Request{
-			NamespacedName: types.NamespacedName{Name: noBackupRestore, Namespace: namespaceName},
-		})
+		reqKey := reconcile.Request{NamespacedName: types.NamespacedName{Name: noBackupRestore, Namespace: namespaceName}}
+
+		// First reconcile adds the finalizer.
+		_, err := r.Reconcile(ctx, reqKey)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Second reconcile detects backup disabled and fails.
+		_, err = r.Reconcile(ctx, reqKey)
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: noBackupRestore, Namespace: namespaceName}, restore)).To(Succeed())
@@ -1281,15 +1375,23 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 	})
 
 	// ── R-extra ──────────────────────────────────────────────────────────────────
-	// reconcilePausing: workload deleted between Pending and Pausing (NotFound path).
-	It("reconcilePausing proceeds to ScalingDown when target workload is deleted mid-flight", func() {
+	// reconcileFencing: workload deleted between Pending and Pausing (NotFound path).
+	It("reconcileFencing proceeds to Restoring when target workload is deleted mid-flight", func() {
 		dbKey, restoreKey, deployKey := newStateMachineResources("pausing-dep-deleted", 1)
 		defer cleanupResources(dbKey, restoreKey, deployKey)
 
 		reconciler := newReconciler()
 
-		// Pending → Pausing.
+		// Adds finalizer.
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Pending → AcquiringLock.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// AcquiringLock → Fencing (sets pause annotation).
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		// Wait for ConfigMap to be paused by the background LitestreamReplica controller.
@@ -1301,20 +1403,19 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 			g.Expect(cm.Data["litestream.yml"]).To(Equal("dbs: []\n"))
 		}).Should(Succeed())
 
-		// Delete the Deployment before reconciling Pausing — simulates a race where the
+		// Delete the Deployment before reconciling Fencing — simulates a race where the
 		// workload was already torn down.
 		dep := &appsv1.Deployment{}
 		Expect(k8sClient.Get(ctx, deployKey, dep)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, dep)).To(Succeed())
-		// Update cleanupResources won't fail — it skips missing resources.
 
-		// Reconcile Pausing: workload not found → skip scale-down, go to ScalingDown.
+		// Reconcile Fencing: workload not found → skip scale-down, proceed to create Job.
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		restore := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseScalingDown))
+		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseRestoring))
 	})
 
 	// scaleWorkload: already at target replica count (early return, no patch).
@@ -1374,18 +1475,26 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		restore := &databasev1.LitestreamRestore{
 			ObjectMeta: metav1.ObjectMeta{Name: noS3Restore, Namespace: namespaceName},
 			Spec: databasev1.LitestreamRestoreSpec{
-				SourceRef:  noS3DB,
-				TargetPVC:  targetPVC,
-				TargetPath: targetPath,
+				SourceRef: databasev1.RestoreSourceRef{Name: noS3DB},
+				Mode:      databasev1.RestoreModeToPVC,
+				Target: &databasev1.RestoreTarget{
+					PVC:  targetPVC,
+					Path: targetPath,
+				},
 			},
 		}
 		Expect(k8sClient.Create(ctx, restore)).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, restore) }()
 
 		r := newReconciler()
-		_, err := r.Reconcile(ctx, reconcile.Request{
-			NamespacedName: types.NamespacedName{Name: noS3Restore, Namespace: namespaceName},
-		})
+		reqKey := reconcile.Request{NamespacedName: types.NamespacedName{Name: noS3Restore, Namespace: namespaceName}}
+
+		// First reconcile adds the finalizer.
+		_, err := r.Reconcile(ctx, reqKey)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Second reconcile detects no S3 destination and fails.
+		_, err = r.Reconcile(ctx, reqKey)
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: noS3Restore, Namespace: namespaceName}, restore)).To(Succeed())
@@ -1393,92 +1502,37 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		Expect(restore.Status.Message).To(ContainSubstring("S3 destination"))
 	})
 
-	// reconcileScalingUp — OriginalReplicas is nil (edge case: uses default of 1).
-	It("reconcileScalingUp scales back to 1 and completes when OriginalReplicas is nil", func() {
+	// reconcileResuming — OriginalReplicas is nil (edge case: uses default of 1).
+	It("reconcileResuming scales back to 1 and completes when OriginalReplicas is nil", func() {
 		dbKey, restoreKey, deployKey := newStateMachineResources("scaling-up-nil-replicas", 1)
 		defer cleanupResources(dbKey, restoreKey, deployKey)
 
 		reconciler := newReconciler()
-		driveToValidating(ctx, reconciler, dbKey, restoreKey, deployKey)
-		simulateValidationSuccess(ctx, restoreKey)
-
-		// Validating → ScalingUp.
-		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
-		Expect(err).NotTo(HaveOccurred())
+		driveToResuming(ctx, reconciler, dbKey, restoreKey, deployKey)
 
 		// Override OriginalReplicas to nil to exercise the default-to-1 path.
 		restore := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseScalingUp))
+		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseResuming))
 
 		patch := client.MergeFrom(restore.DeepCopy())
 		restore.Status.OriginalReplicas = nil
 		Expect(k8sClient.Status().Patch(ctx, restore, patch)).To(Succeed())
 
-		// ScalingUp → Complete with nil OriginalReplicas (defaults to 1). Retry until
+		// Resuming → Complete with nil OriginalReplicas (defaults to 1). Retry until
 		// the LitestreamReplica controller updates the ConfigMap (cache propagation).
 		Eventually(func(g Gomega) {
 			_, reconcileErr := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 			g.Expect(reconcileErr).NotTo(HaveOccurred())
 			r := &databasev1.LitestreamRestore{}
 			g.Expect(k8sClient.Get(ctx, restoreKey, r)).To(Succeed())
-			g.Expect(r.Status.Phase).To(Equal(databasev1.RestorePhaseComplete))
+			g.Expect(r.Status.Phase).To(Equal(databasev1.RestorePhaseCompleted))
 		}, 10*time.Second, 100*time.Millisecond).Should(Succeed())
 		_ = dbKey
 		_ = deployKey
 	})
 
-	// reconcileValidating idempotency — second call silently ignores AlreadyExists
-	// when creating the validation Job.
-	It("reconcileValidating is idempotent when validation Job already exists", func() {
-		dbKey, restoreKey, deployKey := newStateMachineResources("validating-idempotent", 1)
-		defer cleanupResources(dbKey, restoreKey, deployKey)
-
-		reconciler := newReconciler()
-		// driveToValidating creates the validation Job on the second Validating reconcile.
-		driveToValidating(ctx, reconciler, dbKey, restoreKey, deployKey)
-
-		// Reconcile again in Validating — validation Job already exists (AlreadyExists silently ignored).
-		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
-		Expect(err).NotTo(HaveOccurred())
-
-		restore := &databasev1.LitestreamRestore{}
-		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		// Still Validating — Job not complete yet.
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseValidating))
-		_ = dbKey
-		_ = deployKey
-	})
-
-	// buildValidationJob — explicit InitImage from sourceDB spec.
-	It("buildValidationJob uses sourceDB.spec.initImage when set", func() {
-		const customInitImage = "my-org/sqlite3:v1.2.3"
-		dbKey, restoreKey, deployKey := newStateMachineResources("custom-initimage-validate", 1)
-		defer cleanupResources(dbKey, restoreKey, deployKey)
-
-		// Update the LitestreamReplica to have a custom initImage.
-		Eventually(func() error {
-			db := &databasev1.LitestreamReplica{}
-			if err := k8sClient.Get(ctx, dbKey, db); err != nil {
-				return err
-			}
-			db.Spec.InitImage = customInitImage
-			return k8sClient.Update(ctx, db)
-		}).Should(Succeed())
-
-		reconciler := newReconciler()
-		driveToValidating(ctx, reconciler, dbKey, restoreKey, deployKey)
-
-		// Check the validation Job uses the custom image.
-		validateJob := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{
-			Name: restoreKey.Name + "-validate", Namespace: namespaceName,
-		}, validateJob)).To(Succeed())
-		Expect(validateJob.Spec.Template.Spec.Containers[0].Image).To(Equal(customInitImage))
-		_ = deployKey
-	})
-
-	// buildRestoreJob / buildValidationJob — SecurityContext from spec.runAsUser/runAsGroup.
+	// buildRestoreJob — SecurityContext from spec.runAsUser/runAsGroup.
 	Context("SecurityContext from spec.runAsUser / spec.runAsGroup", func() {
 		var (
 			reconciler *LitestreamRestoreReconciler
@@ -1506,22 +1560,25 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 			restore = &databasev1.LitestreamRestore{
 				ObjectMeta: metav1.ObjectMeta{Name: "sec-ctx-test", Namespace: namespaceName},
 				Spec: databasev1.LitestreamRestoreSpec{
-					SourceRef:  sourceDB.Name,
-					TargetPVC:  "test-pvc",
-					TargetPath: "/data/app.db",
+					SourceRef: databasev1.RestoreSourceRef{Name: sourceDB.Name},
+					Mode:      databasev1.RestoreModeToPVC,
+					Target: &databasev1.RestoreTarget{
+						PVC:  "test-pvc",
+						Path: "/data/app.db",
+					},
 				},
 			}
 		})
 
 		It("buildRestoreJob has no SecurityContext when RunAsUser/RunAsGroup omitted", func() {
-			job := reconciler.buildRestoreJob(restore, sourceDB, "restore-job")
+			job := reconciler.buildRestoreJob(restore, sourceDB, "restore-job", "test-pvc", "/data/app.db")
 			Expect(job.Spec.Template.Spec.SecurityContext).To(BeNil())
 		})
 
 		It("buildRestoreJob sets PodSecurityContext when RunAsUser is set", func() {
 			uid := int64(1000)
 			restore.Spec.RunAsUser = &uid
-			job := reconciler.buildRestoreJob(restore, sourceDB, "restore-job")
+			job := reconciler.buildRestoreJob(restore, sourceDB, "restore-job", "test-pvc", "/data/app.db")
 			Expect(job.Spec.Template.Spec.SecurityContext).NotTo(BeNil())
 			Expect(job.Spec.Template.Spec.SecurityContext.RunAsUser).NotTo(BeNil())
 			Expect(*job.Spec.Template.Spec.SecurityContext.RunAsUser).To(Equal(int64(1000)))
@@ -1532,31 +1589,13 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 			uid, gid := int64(1000), int64(2000)
 			restore.Spec.RunAsUser = &uid
 			restore.Spec.RunAsGroup = &gid
-			job := reconciler.buildRestoreJob(restore, sourceDB, "restore-job")
+			job := reconciler.buildRestoreJob(restore, sourceDB, "restore-job", "test-pvc", "/data/app.db")
 			secCtx := job.Spec.Template.Spec.SecurityContext
 			Expect(secCtx).NotTo(BeNil())
 			Expect(*secCtx.RunAsUser).To(Equal(int64(1000)))
 			Expect(*secCtx.RunAsGroup).To(Equal(int64(2000)))
 		})
 
-		It("buildValidationJob defaults to root SecurityContext when RunAsUser/RunAsGroup omitted", func() {
-			job := reconciler.buildValidationJob(restore, sourceDB, "validate-job")
-			secCtx := job.Spec.Template.Spec.SecurityContext
-			Expect(secCtx).NotTo(BeNil())
-			Expect(*secCtx.RunAsUser).To(Equal(int64(0)))
-			Expect(*secCtx.RunAsGroup).To(Equal(int64(0)))
-		})
-
-		It("buildValidationJob uses restore's RunAsUser/RunAsGroup when set", func() {
-			uid, gid := int64(1000), int64(1000)
-			restore.Spec.RunAsUser = &uid
-			restore.Spec.RunAsGroup = &gid
-			job := reconciler.buildValidationJob(restore, sourceDB, "validate-job")
-			secCtx := job.Spec.Template.Spec.SecurityContext
-			Expect(secCtx).NotTo(BeNil())
-			Expect(*secCtx.RunAsUser).To(Equal(int64(1000)))
-			Expect(*secCtx.RunAsGroup).To(Equal(int64(1000)))
-		})
 	})
 
 	// reconcileRunning — Job still running (no conditions set yet → requeue).
@@ -1576,21 +1615,29 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		restore := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
 		// Phase stays at Running — job not yet complete.
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseRunning))
+		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseRestoring))
 		_ = dbKey
 		_ = deployKey
 	})
 })
 
-// driveToRunning drives a restore through Pending → Pausing → ScalingDown → Running
+// driveToRunning drives a restore through finalizer addition → Pending → AcquiringLock → Fencing → Restoring
 // by simulating ConfigMap update and Deployment scale-down completion.
 func driveToRunning(
 	ctx context.Context,
 	reconciler *LitestreamRestoreReconciler,
 	dbKey, restoreKey, deployKey types.NamespacedName,
 ) {
-	// Pending → Pausing.
+	// First reconcile adds the finalizer and requeues.
 	_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+	Expect(err).NotTo(HaveOccurred())
+
+	// Pending → AcquiringLock.
+	_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+	Expect(err).NotTo(HaveOccurred())
+
+	// AcquiringLock → Fencing (sets pause annotation).
+	_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 	Expect(err).NotTo(HaveOccurred())
 
 	// Simulate ConfigMap updated to dbs: [].
@@ -1605,10 +1652,6 @@ func driveToRunning(
 	cm.Data["litestream.yml"] = "dbs: []\n"
 	Expect(k8sClient.Patch(ctx, cm, cmPatch)).To(Succeed())
 
-	// Pausing → ScalingDown.
-	_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
-	Expect(err).NotTo(HaveOccurred())
-
 	// Simulate Deployment fully scaled down.
 	dep := &appsv1.Deployment{}
 	Expect(k8sClient.Get(ctx, deployKey, dep)).To(Succeed())
@@ -1616,18 +1659,18 @@ func driveToRunning(
 	dep.Status.Replicas = 0
 	Expect(k8sClient.Status().Patch(ctx, dep, depStatusPatch)).To(Succeed())
 
-	// ScalingDown → Running.
+	// Fencing → Restoring (creates Job).
 	_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 	Expect(err).NotTo(HaveOccurred())
 
 	restore := &databasev1.LitestreamRestore{}
 	Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-	Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseRunning))
+	Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseRestoring))
 }
 
-// driveToValidating drives a restore through Running → Validating by simulating
-// a successful restore Job and creating the validation Job.
-func driveToValidating(
+// driveToResuming drives a restore through Restoring → Resuming by simulating
+// a successful restore Job (integrity check is native via -integrity-check flag).
+func driveToResuming(
 	ctx context.Context,
 	reconciler *LitestreamRestoreReconciler,
 	dbKey, restoreKey, deployKey types.NamespacedName,
@@ -1648,17 +1691,13 @@ func driveToValidating(
 	}
 	Expect(k8sClient.Status().Patch(ctx, job, jobStatusPatch)).To(Succeed())
 
-	// Running → Validating (creates validation Job).
+	// Restoring → Resuming.
 	_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
-	Expect(err).NotTo(HaveOccurred())
-
-	// First Validating reconcile creates the validation Job.
-	_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 	Expect(err).NotTo(HaveOccurred())
 
 	restore := &databasev1.LitestreamRestore{}
 	Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-	Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseValidating))
+	Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseResuming))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1700,7 +1739,21 @@ var _ = Describe("LitestreamRestore State Machine with StatefulSet target", func
 				Template: corev1.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": stsName}},
 					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{{Name: "app", Image: "busybox"}},
+						Containers: []corev1.Container{{
+							Name:  "app",
+							Image: "busybox",
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "data", MountPath: "/data"},
+							},
+						}},
+						Volumes: []corev1.Volume{{
+							Name: "data",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: targetPVC,
+								},
+							},
+						}},
 					},
 				},
 			},
@@ -1737,9 +1790,7 @@ var _ = Describe("LitestreamRestore State Machine with StatefulSet target", func
 		restore := &databasev1.LitestreamRestore{
 			ObjectMeta: metav1.ObjectMeta{Name: restoreName, Namespace: namespaceName},
 			Spec: databasev1.LitestreamRestoreSpec{
-				SourceRef:  dbName,
-				TargetPVC:  targetPVC,
-				TargetPath: targetPath,
+				SourceRef: databasev1.RestoreSourceRef{Name: dbName},
 			},
 		}
 		Expect(k8sClient.Create(ctx, restore)).To(Succeed())
@@ -1756,7 +1807,7 @@ var _ = Describe("LitestreamRestore State Machine with StatefulSet target", func
 		if err := k8sClient.Get(ctx, dbKey, db); err == nil {
 			_ = k8sClient.Delete(ctx, db)
 		}
-		for _, suffix := range []string{"-litestream", "-init-sql"} {
+		for _, suffix := range []string{"-litestream", "-bootstrap-sql"} {
 			cm := &corev1.ConfigMap{}
 			if err := k8sClient.Get(ctx, types.NamespacedName{
 				Name: dbKey.Name + suffix, Namespace: namespaceName,
@@ -1784,21 +1835,34 @@ var _ = Describe("LitestreamRestore State Machine with StatefulSet target", func
 		}
 	}
 
-	It("sets pause annotation and transitions to Pausing (StatefulSet target)", func() {
+	It("transitions to AcquiringLock and sets pause annotation (StatefulSet target)", func() {
 		dbKey, restoreKey, stsKey := newStateMachineResourcesSTS("pause-pending-sts", 1)
 		defer cleanupSTS(dbKey, restoreKey, stsKey)
 
 		reconciler := newReconciler()
+
+		// Adds finalizer.
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Pending → AcquiringLock.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		restore := &databasev1.LitestreamRestore{}
+		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
+		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseAcquiringLock))
+
+		// AcquiringLock → Fencing (sets pause annotation).
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		db := &databasev1.LitestreamReplica{}
 		Expect(k8sClient.Get(ctx, dbKey, db)).To(Succeed())
 		Expect(db.Annotations[databasev1.AnnotationPause]).To(Equal("true"))
 
-		restore := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhasePausing))
+		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseFencing))
 	})
 
 	It("scales StatefulSet to 0 and records originalReplicas", func() {
@@ -1807,14 +1871,29 @@ var _ = Describe("LitestreamRestore State Machine with StatefulSet target", func
 
 		reconciler := newReconciler()
 
-		// Pending → Pausing.
+		// Simulate StatefulSet having 1 running pod.
+		sts := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, stsKey, sts)).To(Succeed())
+		stsStatusPatch := client.MergeFrom(sts.DeepCopy())
+		sts.Status.Replicas = 1
+		Expect(k8sClient.Status().Patch(ctx, sts, stsStatusPatch)).To(Succeed())
+
+		// Adds finalizer.
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Pending → AcquiringLock.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		restore := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
 		Expect(restore.Status.OriginalReplicas).NotTo(BeNil())
 		Expect(*restore.Status.OriginalReplicas).To(Equal(int32(1)))
+
+		// AcquiringLock → Fencing (sets pause annotation).
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
 
 		// Simulate ConfigMap updated to dbs: [].
 		cm := &corev1.ConfigMap{}
@@ -1828,11 +1907,10 @@ var _ = Describe("LitestreamRestore State Machine with StatefulSet target", func
 		cm.Data["litestream.yml"] = "dbs: []\n"
 		Expect(k8sClient.Patch(ctx, cm, cmPatch)).To(Succeed())
 
-		// Pausing → ScalingDown (scales StatefulSet to 0).
+		// Fencing → scales StatefulSet to 0.
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
-		sts := &appsv1.StatefulSet{}
 		Expect(k8sClient.Get(ctx, stsKey, sts)).To(Succeed())
 		Expect(sts.Spec.Replicas).NotTo(BeNil())
 		Expect(*sts.Spec.Replicas).To(BeZero())
@@ -1844,8 +1922,16 @@ var _ = Describe("LitestreamRestore State Machine with StatefulSet target", func
 
 		reconciler := newReconciler()
 
-		// Drive through Pending → Pausing.
+		// Adds finalizer.
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Pending → AcquiringLock.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		// AcquiringLock → Fencing (sets pause annotation).
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		// Update ConfigMap to reflect pause.
@@ -1860,7 +1946,7 @@ var _ = Describe("LitestreamRestore State Machine with StatefulSet target", func
 		cm.Data["litestream.yml"] = "dbs: []\n"
 		Expect(k8sClient.Patch(ctx, cm, cmPatch)).To(Succeed())
 
-		// Pausing → ScalingDown.
+		// Fencing → scales to 0.
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -1871,29 +1957,38 @@ var _ = Describe("LitestreamRestore State Machine with StatefulSet target", func
 		sts.Status.Replicas = 0
 		Expect(k8sClient.Status().Patch(ctx, sts, stsStatusPatch)).To(Succeed())
 
-		// ScalingDown → Running (creates restore Job).
+		// Fencing → Restoring (creates restore Job).
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 		Expect(err).NotTo(HaveOccurred())
 
 		restore := &databasev1.LitestreamRestore{}
 		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseRunning))
+		Expect(restore.Status.Phase).To(Equal(databasev1.RestorePhaseRestoring))
 
-		// Transition through Validating → ScalingUp by faking job success.
-		restore = &databasev1.LitestreamRestore{}
-		Expect(k8sClient.Get(ctx, restoreKey, restore)).To(Succeed())
-		patch := client.MergeFrom(restore.DeepCopy())
-		restore.Status.Phase = databasev1.RestorePhaseScalingUp
-		Expect(k8sClient.Status().Patch(ctx, restore, patch)).To(Succeed())
+		// Simulate restore Job success → Restoring → Resuming.
+		jobKey := types.NamespacedName{Name: restoreKey.Name + "-restore", Namespace: restoreKey.Namespace}
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, jobKey, job)).To(Succeed())
+		now := metav1.Now()
+		jobStatusPatch := client.MergeFrom(job.DeepCopy())
+		job.Status.StartTime = &now
+		job.Status.CompletionTime = &now
+		job.Status.Conditions = []batchv1.JobCondition{
+			{Type: batchv1.JobSuccessCriteriaMet, Status: corev1.ConditionTrue, LastProbeTime: now, LastTransitionTime: now},
+			{Type: batchv1.JobComplete, Status: corev1.ConditionTrue, LastProbeTime: now, LastTransitionTime: now},
+		}
+		Expect(k8sClient.Status().Patch(ctx, job, jobStatusPatch)).To(Succeed())
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+		Expect(err).NotTo(HaveOccurred())
 
-		// ScalingUp → Complete (scales StatefulSet back up to 1). Retry until the
+		// Resuming → Complete (scales StatefulSet back up to 1). Retry until the
 		// LitestreamReplica controller updates the ConfigMap (cache propagation).
 		Eventually(func(g Gomega) {
 			_, reconcileErr := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
 			g.Expect(reconcileErr).NotTo(HaveOccurred())
 			r := &databasev1.LitestreamRestore{}
 			g.Expect(k8sClient.Get(ctx, restoreKey, r)).To(Succeed())
-			g.Expect(r.Status.Phase).To(Equal(databasev1.RestorePhaseComplete))
+			g.Expect(r.Status.Phase).To(Equal(databasev1.RestorePhaseCompleted))
 		}, 10*time.Second, 100*time.Millisecond).Should(Succeed())
 
 		Expect(k8sClient.Get(ctx, stsKey, sts)).To(Succeed())
@@ -1901,19 +1996,3 @@ var _ = Describe("LitestreamRestore State Machine with StatefulSet target", func
 		Expect(*sts.Spec.Replicas).To(Equal(int32(1)))
 	})
 })
-
-// simulateValidationSuccess marks the validation Job as complete (integrity check passed).
-func simulateValidationSuccess(ctx context.Context, restoreKey types.NamespacedName) {
-	validateJobKey := types.NamespacedName{Name: restoreKey.Name + "-validate", Namespace: restoreKey.Namespace}
-	validateJob := &batchv1.Job{}
-	Expect(k8sClient.Get(ctx, validateJobKey, validateJob)).To(Succeed())
-	now := metav1.Now()
-	vpatch := client.MergeFrom(validateJob.DeepCopy())
-	validateJob.Status.StartTime = &now
-	validateJob.Status.CompletionTime = &now
-	validateJob.Status.Conditions = []batchv1.JobCondition{
-		{Type: batchv1.JobSuccessCriteriaMet, Status: corev1.ConditionTrue, LastProbeTime: now, LastTransitionTime: now},
-		{Type: batchv1.JobComplete, Status: corev1.ConditionTrue, LastProbeTime: now, LastTransitionTime: now},
-	}
-	Expect(k8sClient.Status().Patch(ctx, validateJob, vpatch)).To(Succeed())
-}
