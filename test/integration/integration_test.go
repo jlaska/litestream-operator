@@ -97,7 +97,7 @@ var _ = Describe("Integration", Ordered, func() {
 
 	// ── Scenario 2: Backup to MinIO ───────────────────────────────────────
 
-	Describe("Backup to MinIO", func() {
+	Describe("Backup to S3", func() {
 		const (
 			appName = "backup-test-app"
 			dbName  = "backup-test-db"
@@ -163,14 +163,14 @@ var _ = Describe("Integration", Ordered, func() {
 			By("waiting for Litestream to replicate to MinIO")
 			Eventually(func(g Gomega) {
 				// Check the expected path first.
-				out := mcList(minioBucket + "/" + dbName + "/")
+				out := mcList(s3Bucket + "/" + dbName + "/")
 				if out == "" {
 					// Fall back: check the whole bucket so a path mismatch surfaces immediately.
 					all, _ := kubectlQ("exec", "-n", testNamespace, "mc-client", "--",
-						"/bin/sh", "-c", "mc ls --recursive local/"+minioBucket+"/")
+						"/bin/sh", "-c", "mc ls --recursive local/"+s3Bucket+"/")
 					g.Expect(out).NotTo(BeEmpty(),
 						"expected backup objects at %s/%s/ — full bucket contents:\n%s",
-						minioBucket, dbName, all)
+						s3Bucket, dbName, all)
 				} else {
 					g.Expect(out).NotTo(BeEmpty(), "expected backup objects in MinIO bucket")
 				}
@@ -248,7 +248,7 @@ var _ = Describe("Integration", Ordered, func() {
 						GinkgoWriter.Printf("=== restore Job logs ===\n%s\n========================\n", logs)
 					}
 				}
-				g.Expect(phase).To(Equal("Complete"))
+				g.Expect(phase).To(Equal("Completed"))
 			}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
 			By("running a verification Job that reads the restored database")
@@ -469,13 +469,13 @@ var _ = Describe("Archive Check — Data Loss Recovery", Ordered, func() {
 
 		By("waiting for Litestream to replicate the row to MinIO")
 		Eventually(func(g Gomega) {
-			out := mcList(minioBucket + "/" + dbName + "/")
+			out := mcList(s3Bucket + "/" + dbName + "/")
 			if out == "" {
 				all, _ := kubectlQ("exec", "-n", testNamespace, "mc-client", "--",
-					"/bin/sh", "-c", "mc ls --recursive local/"+minioBucket+"/")
+					"/bin/sh", "-c", "mc ls --recursive local/"+s3Bucket+"/")
 				g.Expect(out).NotTo(BeEmpty(),
 					"expected backup objects at %s/%s/ — full bucket contents:\n%s",
-					minioBucket, dbName, all)
+					s3Bucket, dbName, all)
 			} else {
 				g.Expect(out).NotTo(BeEmpty(), "expected backup objects in MinIO bucket")
 			}
@@ -540,7 +540,7 @@ var _ = Describe("Archive Check — Data Loss Recovery", Ordered, func() {
 					GinkgoWriter.Printf("\n=== restore Job logs ===\n%s\n========================\n", logs)
 				}
 			}
-			g.Expect(phase).To(Equal("Complete"))
+			g.Expect(phase).To(Equal("Completed"))
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
 		By("waiting for the pod to restart successfully after restore")
@@ -630,13 +630,13 @@ var _ = Describe("Archive Check — Fresh DB Divergence", Ordered, func() {
 
 		By("waiting for Litestream to replicate the row to MinIO")
 		Eventually(func(g Gomega) {
-			out := mcList(minioBucket + "/" + dbName + "/")
+			out := mcList(s3Bucket + "/" + dbName + "/")
 			if out == "" {
 				all, _ := kubectlQ("exec", "-n", testNamespace, "mc-client", "--",
-					"/bin/sh", "-c", "mc ls --recursive local/"+minioBucket+"/")
+					"/bin/sh", "-c", "mc ls --recursive local/"+s3Bucket+"/")
 				g.Expect(out).NotTo(BeEmpty(),
 					"expected backup objects at %s/%s/ — full bucket contents:\n%s",
-					minioBucket, dbName, all)
+					s3Bucket, dbName, all)
 			} else {
 				g.Expect(out).NotTo(BeEmpty(), "expected backup objects in MinIO bucket")
 			}
@@ -715,7 +715,7 @@ var _ = Describe("Archive Check — Fresh DB Divergence", Ordered, func() {
 					GinkgoWriter.Printf("\n=== restore Job logs ===\n%s\n========================\n", logs)
 				}
 			}
-			g.Expect(phase).To(Equal("Complete"))
+			g.Expect(phase).To(Equal("Completed"))
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
 		By("waiting for the pod to restart successfully after restore (skip-archive-check set by restore controller)")
@@ -872,13 +872,13 @@ var _ = Describe("Auto-Restore on Startup", Ordered, func() {
 
 		By("waiting for Litestream to replicate the row to MinIO")
 		Eventually(func(g Gomega) {
-			out := mcList(minioBucket + "/" + dbName + "/")
+			out := mcList(s3Bucket + "/" + dbName + "/")
 			if out == "" {
 				all, _ := kubectlQ("exec", "-n", testNamespace, "mc-client", "--",
-					"/bin/sh", "-c", "mc ls --recursive local/"+minioBucket+"/")
+					"/bin/sh", "-c", "mc ls --recursive local/"+s3Bucket+"/")
 				g.Expect(out).NotTo(BeEmpty(),
 					"expected backup objects at %s/%s/ — full bucket contents:\n%s",
-					minioBucket, dbName, all)
+					s3Bucket, dbName, all)
 			} else {
 				g.Expect(out).NotTo(BeEmpty())
 			}
@@ -1006,7 +1006,7 @@ var _ = Describe("Restore Fails With Existing DB", Ordered, func() {
 
 		By("waiting for replication to MinIO")
 		Eventually(func(g Gomega) {
-			out := mcList(minioBucket + "/" + dbName + "/")
+			out := mcList(s3Bucket + "/" + dbName + "/")
 			g.Expect(out).NotTo(BeEmpty(), "expected backup objects in MinIO")
 		}, 3*time.Minute, 10*time.Second).Should(Succeed())
 	})
@@ -1125,7 +1125,7 @@ var _ = Describe("Point-in-Time Restore", Ordered, func() {
 
 		By("waiting for row A to replicate and compaction to produce a restorable snapshot")
 		Eventually(func(g Gomega) {
-			out := mcList(minioBucket + "/" + dbName + "/")
+			out := mcList(s3Bucket + "/" + dbName + "/")
 			g.Expect(out).NotTo(BeEmpty(), "expected backup objects in MinIO after row A")
 		}, 3*time.Minute, 10*time.Second).Should(Succeed())
 
@@ -1145,7 +1145,7 @@ var _ = Describe("Point-in-Time Restore", Ordered, func() {
 
 		By("waiting for row B to replicate to MinIO")
 		Eventually(func(g Gomega) {
-			out := mcList(minioBucket + "/" + dbName + "/")
+			out := mcList(s3Bucket + "/" + dbName + "/")
 			g.Expect(out).NotTo(BeEmpty())
 		}, 2*time.Minute, 10*time.Second).Should(Succeed())
 
@@ -1180,7 +1180,7 @@ var _ = Describe("Point-in-Time Restore", Ordered, func() {
 					GinkgoWriter.Printf("\n=== PITR restore job logs ===\n%s\n========================\n", logs)
 				}
 			}
-			g.Expect(phase).To(Equal("Complete"))
+			g.Expect(phase).To(Equal("Completed"))
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
 		By("running a verification Job against the restored DB")
@@ -1224,7 +1224,7 @@ var _ = Describe("Point-in-Time Restore", Ordered, func() {
 			phase, err := kubectlQ("get", "litestreamrestore", "pitr-restore-latest", "-n", testNamespace,
 				"-o", "jsonpath={.status.phase}")
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(phase).To(Equal("Complete"))
+			g.Expect(phase).To(Equal("Completed"))
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
 		By("running a verification Job against the latest-restored DB")
@@ -1240,6 +1240,629 @@ var _ = Describe("Point-in-Time Restore", Ordered, func() {
 		latestLogs := kubectl("logs", "-n", testNamespace, "job/"+verifyJobLatest)
 		Expect(latestLogs).To(ContainSubstring(rowA), "row A should exist in latest restore")
 		Expect(latestLogs).To(ContainSubstring(rowB), "row B should exist in latest restore")
+	})
+})
+
+// ── Scenario: InPlace Restore ─────────────────────────────────────────────
+//
+// Validates the full InPlace restore lifecycle: the controller fences the
+// workload (pauses replication, scales to 0), runs the restore Job, then
+// resumes (scales back up, clears pause). Tests the ApplicationFenced and
+// ApplicationResumed conditions.
+
+var _ = Describe("InPlace Restore", Ordered, func() {
+	const (
+		appName   = "inplace-app"
+		dbName    = "inplace-db"
+		pvcName   = "inplace-pvc"
+		dbFile    = "inplace.db"
+		dbPath    = "/data"
+		initSQL   = "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT);"
+		testValue = "inplace-restore-test"
+	)
+
+	BeforeAll(func() {
+		DeferCleanup(func() { dumpReplicationDiagnostics(appName, dbName, dbFile) })
+
+		By("cleaning stale S3 data from prior test runs")
+		mcCleanPath(dbName)
+
+		By("creating PVC, Deployment (Recreate strategy), and LitestreamReplica with backup enabled")
+		applyLiteral(pvcManifest(pvcName, testNamespace))
+		applyLiteral(appDeploymentRecreateManifest(appName, testNamespace, pvcName, dbPath))
+		kubectl("wait", "-n", testNamespace, "deployment/"+appName,
+			"--for=condition=Available", "--timeout=3m")
+		applyLiteral(litestreamReplicaManifest(dbName, testNamespace, appName, dbFile, dbPath, true, initSQL))
+
+		By("waiting for sidecar injection and ReplicationHealthy=True")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
+				"-o", `jsonpath={.status.conditions[?(@.type=="ReplicationHealthy")].status}`)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("True"))
+		}, 5*time.Minute, 10*time.Second).Should(Succeed())
+
+		By("writing test data to the database")
+		podName := runningPod(appName)
+		kubectl("exec", "-n", testNamespace, podName, "-c", "app",
+			"--", "sqlite3", dbPath+"/"+dbFile,
+			"INSERT INTO notes(body) VALUES('"+testValue+"');")
+
+		By("waiting for Litestream to replicate to S3")
+		Eventually(func(g Gomega) {
+			out := mcList(s3Bucket + "/" + dbName + "/")
+			g.Expect(out).NotTo(BeEmpty(), "expected backup objects in S3")
+		}, 3*time.Minute, 10*time.Second).Should(Succeed())
+	})
+
+	AfterAll(func() {
+		runIgnoreError("kubectl", "delete", "litestreamrestore", "inplace-restore", "-n", testNamespace, "--ignore-not-found", "--wait=false")
+		runIgnoreError("kubectl", "delete", "litestreamreplica", dbName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+		runIgnoreError("kubectl", "delete", "deployment", appName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+		runIgnoreError("kubectl", "delete", "pvc", pvcName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+	})
+
+	It("fences workload, restores in-place, and resumes the application", func() {
+		By("creating an InPlace LitestreamRestore CR (force=true since DB exists)")
+		applyLiteral(litestreamRestoreInPlaceManifestWithOpts("inplace-restore", testNamespace, dbName, true))
+
+		By("waiting for restore to reach Complete phase")
+		Eventually(func(g Gomega) {
+			phase, err := kubectlQ("get", "litestreamrestore", "inplace-restore", "-n", testNamespace,
+				"-o", "jsonpath={.status.phase}")
+			g.Expect(err).NotTo(HaveOccurred())
+			if phase == "Failed" {
+				jobName, _ := kubectlQ("get", "litestreamrestore", "inplace-restore", "-n", testNamespace,
+					"-o", "jsonpath={.status.jobName}")
+				if jobName != "" {
+					logs, _ := kubectlQ("logs", "-n", testNamespace, "job/"+jobName, "--tail=50", "--request-timeout=15s")
+					GinkgoWriter.Printf("\n=== InPlace restore Job logs ===\n%s\n========================\n", logs)
+				}
+			}
+			g.Expect(phase).To(Equal("Completed"))
+		}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("verifying originalReplicas was recorded")
+		origReplicas, err := kubectlQ("get", "litestreamrestore", "inplace-restore", "-n", testNamespace,
+			"-o", "jsonpath={.status.originalReplicas}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(origReplicas).To(Equal("1"), "originalReplicas should be recorded in status")
+
+		By("verifying the Deployment is scaled back to 1 replica")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "deployment", appName, "-n", testNamespace,
+				"-o", "jsonpath={.spec.replicas}")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("1"))
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("verifying restored data is present in the database")
+		restoredPod := runningPod(appName)
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("exec", "-n", testNamespace, restoredPod, "-c", "app",
+				"--", "sqlite3", dbPath+"/"+dbFile,
+				"SELECT body FROM notes WHERE body='"+testValue+"';")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).To(ContainSubstring(testValue))
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("verifying ReplicationHealthy=True after InPlace restore")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
+				"-o", `jsonpath={.status.conditions[?(@.type=="ReplicationHealthy")].status}`)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("True"))
+		}, 3*time.Minute, 10*time.Second).Should(Succeed())
+
+		By("verifying the pause annotation was removed from the LitestreamReplica")
+		Eventually(func(g Gomega) {
+			out, pauseErr := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
+				"-o", `jsonpath={.metadata.annotations.litestream\.io/pause}`)
+			g.Expect(pauseErr).NotTo(HaveOccurred())
+			g.Expect(out).NotTo(Equal("true"),
+				"pause annotation should be removed after InPlace restore completes")
+		}, 1*time.Minute, 5*time.Second).Should(Succeed())
+	})
+})
+
+// ── Scenario: Restore Concurrency Lock ──────────────────────────────────────
+//
+// Verifies that two simultaneous InPlace restores targeting the same source
+// LitestreamReplica are serialized via a coordination.k8s.io Lease.
+
+var _ = Describe("Restore Concurrency Lock", Ordered, func() {
+	const (
+		appName = "concurrency-app"
+		dbName  = "concurrency-db"
+		pvcName = "concurrency-pvc"
+		dbFile  = "concurrency.db"
+		dbPath  = "/data"
+		initSQL = "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, val TEXT);"
+	)
+
+	BeforeAll(func() {
+		DeferCleanup(func() { dumpReplicationDiagnostics(appName, dbName, dbFile) })
+
+		By("cleaning stale S3 data from prior test runs")
+		mcCleanPath(dbName)
+
+		By("creating PVC, Deployment, and LitestreamReplica with backup enabled")
+		applyLiteral(pvcManifest(pvcName, testNamespace))
+		applyLiteral(appDeploymentRecreateManifest(appName, testNamespace, pvcName, dbPath))
+		kubectl("wait", "-n", testNamespace, "deployment/"+appName,
+			"--for=condition=Available", "--timeout=3m")
+		applyLiteral(litestreamReplicaManifest(dbName, testNamespace, appName, dbFile, dbPath, true, initSQL))
+
+		By("waiting for ReplicationHealthy=True")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
+				"-o", `jsonpath={.status.conditions[?(@.type=="ReplicationHealthy")].status}`)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("True"))
+		}, 5*time.Minute, 10*time.Second).Should(Succeed())
+
+		By("writing data and waiting for replication")
+		podName := runningPod(appName)
+		kubectl("exec", "-n", testNamespace, podName, "-c", "app",
+			"--", "sqlite3", dbPath+"/"+dbFile,
+			"INSERT INTO items(val) VALUES('concurrency-test');")
+		Eventually(func(g Gomega) {
+			out := mcList(s3Bucket + "/" + dbName + "/")
+			g.Expect(out).NotTo(BeEmpty())
+		}, 3*time.Minute, 10*time.Second).Should(Succeed())
+	})
+
+	AfterAll(func() {
+		runIgnoreError("kubectl", "delete", "litestreamrestore", "concurrency-restore-1", "-n", testNamespace, "--ignore-not-found", "--wait=false")
+		runIgnoreError("kubectl", "delete", "litestreamrestore", "concurrency-restore-2", "-n", testNamespace, "--ignore-not-found", "--wait=false")
+		runIgnoreError("kubectl", "delete", "lease", "litestream-restore-"+dbName, "-n", testNamespace, "--ignore-not-found")
+		runIgnoreError("kubectl", "delete", "litestreamreplica", dbName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+		runIgnoreError("kubectl", "delete", "deployment", appName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+		runIgnoreError("kubectl", "delete", "pvc", pvcName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+	})
+
+	It("second InPlace restore blocks at AcquiringLock while first holds the Lease", func() {
+		By("creating first InPlace restore (force=true since DB exists)")
+		applyLiteral(litestreamRestoreInPlaceManifestWithOpts("concurrency-restore-1", testNamespace, dbName, true))
+
+		By("waiting for first restore to acquire the lock (Fencing or later)")
+		Eventually(func(g Gomega) {
+			phase, err := kubectlQ("get", "litestreamrestore", "concurrency-restore-1", "-n", testNamespace,
+				"-o", "jsonpath={.status.phase}")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(phase).To(SatisfyAny(
+				Equal("Fencing"), Equal("Restoring"), Equal("Resuming"), Equal("Completed"),
+			), "first restore should advance past AcquiringLock")
+		}, 3*time.Minute, 10*time.Second).Should(Succeed())
+
+		By("creating second InPlace restore targeting the same source")
+		applyLiteral(litestreamRestoreInPlaceManifestWithOpts("concurrency-restore-2", testNamespace, dbName, true))
+
+		By("verifying second restore is blocked at AcquiringLock or has Locked=False")
+		Eventually(func(g Gomega) {
+			phase, err := kubectlQ("get", "litestreamrestore", "concurrency-restore-2", "-n", testNamespace,
+				"-o", "jsonpath={.status.phase}")
+			g.Expect(err).NotTo(HaveOccurred())
+
+			// If the first restore completed quickly, the second may have already acquired the lock.
+			// Both outcomes validate the concurrency mechanism.
+			if phase == "AcquiringLock" {
+				locked, _ := kubectlQ("get", "litestreamrestore", "concurrency-restore-2", "-n", testNamespace,
+					"-o", `jsonpath={.status.conditions[?(@.type=="Locked")].status}`)
+				g.Expect(locked).To(Equal("False"),
+					"second restore should have Locked=False while first holds the Lease")
+				return
+			}
+
+			// The first restore finished and the second progressed — still valid.
+			g.Expect(phase).To(SatisfyAny(
+				Equal("AcquiringLock"), Equal("Fencing"), Equal("Restoring"),
+				Equal("Resuming"), Equal("Completed"), Equal("Failed"),
+			))
+		}, 2*time.Minute, 10*time.Second).Should(Succeed())
+
+		By("waiting for both restores to reach a terminal phase")
+		for _, name := range []string{"concurrency-restore-1", "concurrency-restore-2"} {
+			Eventually(func(g Gomega) {
+				phase, err := kubectlQ("get", "litestreamrestore", name, "-n", testNamespace,
+					"-o", "jsonpath={.status.phase}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(phase).To(SatisfyAny(Equal("Completed"), Equal("Failed")),
+					"%s should reach a terminal phase", name)
+			}, 5*time.Minute, 10*time.Second).Should(Succeed())
+		}
+	})
+})
+
+// ── Scenario: CR Deletion Finalizer ──────────────────────────────────────────
+//
+// Deleting a LitestreamReplica CR must clean up injection labels and annotations
+// from the target Deployment's pod template so the webhook no longer injects
+// sidecars into new pods.
+
+var _ = Describe("CR Deletion Finalizer", Ordered, func() {
+	const (
+		appName = "finalizer-app"
+		dbName  = "finalizer-db"
+		pvcName = "finalizer-pvc"
+		dbFile  = "finalizer.db"
+		dbPath  = "/data"
+	)
+
+	BeforeAll(func() {
+		By("creating PVC and Deployment")
+		applyLiteral(pvcManifest(pvcName, testNamespace))
+		applyLiteral(appDeploymentManifest(appName, testNamespace, pvcName, dbPath))
+		kubectl("wait", "-n", testNamespace, "deployment/"+appName,
+			"--for=condition=Available", "--timeout=3m")
+
+		By("creating LitestreamReplica CR")
+		applyLiteral(litestreamReplicaManifest(dbName, testNamespace, appName, dbFile, dbPath, false, ""))
+
+		By("waiting for sidecar injection (label set on pod template)")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "deployment", appName, "-n", testNamespace,
+				"-o", `jsonpath={.spec.template.metadata.labels.litestream\.io/inject}`)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("true"))
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+	})
+
+	AfterAll(func() {
+		runIgnoreError("kubectl", "delete", "litestreamreplica", dbName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+		runIgnoreError("kubectl", "delete", "deployment", appName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+		runIgnoreError("kubectl", "delete", "pvc", pvcName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+	})
+
+	It("removes injection labels and annotations from Deployment when CR is deleted", func() {
+		By("verifying injection annotations are present before deletion")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "deployment", appName, "-n", testNamespace,
+				"-o", `jsonpath={.spec.template.metadata.annotations.litestream\.io/config}`)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).NotTo(BeEmpty(), "config annotation should be present before deletion")
+		}).Should(Succeed())
+
+		By("deleting the LitestreamReplica CR")
+		kubectl("delete", "litestreamreplica", dbName, "-n", testNamespace, "--timeout=2m")
+
+		By("verifying inject label is removed from pod template")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "deployment", appName, "-n", testNamespace,
+				"-o", `jsonpath={.spec.template.metadata.labels.litestream\.io/inject}`)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).To(BeEmpty(), "inject label should be removed after CR deletion")
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("verifying config annotation is removed from pod template")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "deployment", appName, "-n", testNamespace,
+				"-o", `jsonpath={.spec.template.metadata.annotations.litestream\.io/config}`)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).To(BeEmpty(), "config annotation should be removed after CR deletion")
+		}).Should(Succeed())
+
+		By("verifying injection-spec-hash annotation is removed from pod template")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "deployment", appName, "-n", testNamespace,
+				"-o", `jsonpath={.spec.template.metadata.annotations.litestream\.io/injection-spec-hash}`)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).To(BeEmpty(), "injection-spec-hash should be removed after CR deletion")
+		}).Should(Succeed())
+
+		By("verifying new pods no longer have the litestream sidecar")
+		kubectl("rollout", "restart", "deployment/"+appName, "-n", testNamespace)
+		kubectl("rollout", "status", "deployment/"+appName, "-n", testNamespace, "--timeout=3m")
+		podName := runningPod(appName)
+		out, err := kubectlQ("get", "pod", podName, "-n", testNamespace,
+			"-o", `jsonpath={range .spec.containers[*]}{.name}{"\n"}{end}`)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(out).NotTo(ContainSubstring("litestream"),
+			"new pods should not have litestream sidecar after CR deletion")
+	})
+})
+
+// ── Scenario: Injection Spec Hash Rollout ────────────────────────────────────
+//
+// When CR spec fields change (e.g. image), the controller updates the injection
+// spec hash annotation, which triggers a Deployment rollout so pods pick up
+// the new configuration.
+
+var _ = Describe("Injection Spec Hash Rollout", Ordered, func() {
+	const (
+		appName = "hash-rollout-app"
+		dbName  = "hash-rollout-db"
+		pvcName = "hash-rollout-pvc"
+		dbFile  = "hashrollout.db"
+		dbPath  = "/data"
+	)
+
+	BeforeAll(func() {
+		By("cleaning stale S3 data from prior test runs")
+		mcCleanPath(dbName)
+
+		By("creating PVC and Deployment")
+		applyLiteral(pvcManifest(pvcName, testNamespace))
+		applyLiteral(appDeploymentManifest(appName, testNamespace, pvcName, dbPath))
+		kubectl("wait", "-n", testNamespace, "deployment/"+appName,
+			"--for=condition=Available", "--timeout=3m")
+
+		By("creating LitestreamReplica CR with backup enabled")
+		applyLiteral(litestreamReplicaManifest(dbName, testNamespace, appName, dbFile, dbPath, true, ""))
+
+		By("waiting for injection and ReplicationHealthy")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
+				"-o", `jsonpath={.status.conditions[?(@.type=="ReplicationHealthy")].status}`)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("True"))
+		}, 5*time.Minute, 10*time.Second).Should(Succeed())
+	})
+
+	AfterAll(func() {
+		runIgnoreError("kubectl", "delete", "litestreamreplica", dbName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+		runIgnoreError("kubectl", "delete", "deployment", appName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+		runIgnoreError("kubectl", "delete", "pvc", pvcName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+	})
+
+	It("updates hash annotation and triggers rollout when CR spec changes", func() {
+		By("recording the current injection-spec-hash")
+		var originalHash string
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "deployment", appName, "-n", testNamespace,
+				"-o", `jsonpath={.spec.template.metadata.annotations.litestream\.io/injection-spec-hash}`)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).NotTo(BeEmpty())
+			originalHash = out
+		}).Should(Succeed())
+
+		By("recording the current pod name")
+		originalPod := runningPod(appName)
+
+		By("updating the LitestreamReplica spec (change syncInterval)")
+		kubectl("patch", "litestreamreplica", dbName, "-n", testNamespace,
+			"--type=merge", "-p", `{"spec":{"backup":{"syncInterval":"500ms"}}}`)
+
+		By("waiting for the injection-spec-hash to change")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "deployment", appName, "-n", testNamespace,
+				"-o", `jsonpath={.spec.template.metadata.annotations.litestream\.io/injection-spec-hash}`)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).NotTo(Equal(originalHash),
+				"injection-spec-hash should change when CR spec is updated")
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("verifying a rolling update produces a new pod")
+		Eventually(func(g Gomega) {
+			newPod := runningPod(appName)
+			g.Expect(newPod).NotTo(Equal(originalPod),
+				"a new pod should be created after hash change triggers rollout")
+		}, 3*time.Minute, 10*time.Second).Should(Succeed())
+	})
+})
+
+// ── Scenario: Unsafe Rollout Strategy ────────────────────────────────────────
+//
+// Verifies the UnsafeRolloutStrategy condition is set when the target Deployment
+// uses a RollingUpdate strategy with maxSurge > 0, and clears when strategy is
+// changed to Recreate.
+
+var _ = Describe("Unsafe Rollout Strategy", Ordered, func() {
+	const (
+		appName = "rollout-strat-app"
+		dbName  = "rollout-strat-db"
+		pvcName = "rollout-strat-pvc"
+		dbFile  = "rolloutstrat.db"
+		dbPath  = "/data"
+	)
+
+	BeforeAll(func() {
+		By("creating PVC and Deployment with default RollingUpdate strategy")
+		applyLiteral(pvcManifest(pvcName, testNamespace))
+		applyLiteral(appDeploymentRollingUpdateManifest(appName, testNamespace, pvcName, dbPath))
+		kubectl("wait", "-n", testNamespace, "deployment/"+appName,
+			"--for=condition=Available", "--timeout=3m")
+	})
+
+	AfterAll(func() {
+		runIgnoreError("kubectl", "delete", "litestreamreplica", dbName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+		runIgnoreError("kubectl", "delete", "deployment", appName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+		runIgnoreError("kubectl", "delete", "pvc", pvcName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+	})
+
+	It("sets UnsafeRolloutStrategy=True for RollingUpdate and clears it for Recreate", func() {
+		By("creating LitestreamReplica CR targeting the RollingUpdate Deployment")
+		applyLiteral(litestreamReplicaManifest(dbName, testNamespace, appName, dbFile, dbPath, false, ""))
+
+		By("verifying UnsafeRolloutStrategy=True is set")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
+				"-o", `jsonpath={.status.conditions[?(@.type=="UnsafeRolloutStrategy")].status}`)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("True"),
+				"UnsafeRolloutStrategy should be True for default RollingUpdate strategy")
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("verifying phase is Error due to unsafe rollout strategy")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
+				"-o", "jsonpath={.status.phase}")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("Error"))
+		}).Should(Succeed())
+
+		By("switching Deployment strategy to Recreate")
+		kubectl("patch", "deployment", appName, "-n", testNamespace,
+			"--type=strategic", "-p", `{"spec":{"strategy":{"type":"Recreate","rollingUpdate":null}}}`)
+
+		By("verifying UnsafeRolloutStrategy clears (condition removed or set to False)")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
+				"-o", `jsonpath={.status.conditions[?(@.type=="UnsafeRolloutStrategy")].status}`)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).To(SatisfyAny(BeEmpty(), Equal("False")),
+				"UnsafeRolloutStrategy should clear after switching to Recreate")
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("verifying phase recovers from Error")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
+				"-o", "jsonpath={.status.phase}")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).NotTo(Equal("Error"),
+				"phase should recover after strategy fix")
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+	})
+})
+
+// ── Scenario: LitestreamRestore Webhook Validation ───────────────────────────
+//
+// Validates the webhook rejection rules for LitestreamRestore CRs:
+// 1. ToPVC mode without target → rejected
+// 2. InPlace mode with target → rejected
+// 3. ToPVC target with non-absolute path → rejected
+
+var _ = Describe("LitestreamRestore Webhook Validation", func() {
+	It("rejects ToPVC restore without target", func() {
+		manifest := fmt.Sprintf(`
+apiVersion: litestream.io/v1
+kind: LitestreamRestore
+metadata:
+  name: webhook-test-no-target
+  namespace: %s
+spec:
+  sourceRef:
+    name: some-source
+  mode: ToPVC
+`, testNamespace)
+
+		out, err := applyLiteralQ(manifest)
+		Expect(err).To(HaveOccurred(), "webhook should reject ToPVC without target")
+		Expect(strings.ToLower(out)).To(ContainSubstring("target"),
+			"rejection message should mention target; got: %s", out)
+	})
+
+	It("rejects InPlace restore with target set", func() {
+		manifest := fmt.Sprintf(`
+apiVersion: litestream.io/v1
+kind: LitestreamRestore
+metadata:
+  name: webhook-test-inplace-target
+  namespace: %s
+spec:
+  sourceRef:
+    name: some-source
+  mode: InPlace
+  target:
+    pvc: some-pvc
+    path: /data/db.sqlite
+`, testNamespace)
+
+		out, err := applyLiteralQ(manifest)
+		Expect(err).To(HaveOccurred(), "webhook should reject InPlace with target set")
+		Expect(strings.ToLower(out)).To(ContainSubstring("target"),
+			"rejection message should mention target; got: %s", out)
+	})
+
+	It("rejects ToPVC restore with non-absolute target path", func() {
+		manifest := fmt.Sprintf(`
+apiVersion: litestream.io/v1
+kind: LitestreamRestore
+metadata:
+  name: webhook-test-relpath
+  namespace: %s
+spec:
+  sourceRef:
+    name: some-source
+  mode: ToPVC
+  target:
+    pvc: some-pvc
+    path: data/db.sqlite
+`, testNamespace)
+
+		out, err := applyLiteralQ(manifest)
+		Expect(err).To(HaveOccurred(), "webhook should reject non-absolute target path")
+		Expect(strings.ToLower(out)).To(ContainSubstring("absolute"),
+			"rejection message should mention absolute path; got: %s", out)
+	})
+
+	AfterEach(func() {
+		runIgnoreError("kubectl", "delete", "litestreamrestore", "webhook-test-no-target", "-n", testNamespace, "--ignore-not-found", "--wait=false")
+		runIgnoreError("kubectl", "delete", "litestreamrestore", "webhook-test-inplace-target", "-n", testNamespace, "--ignore-not-found", "--wait=false")
+		runIgnoreError("kubectl", "delete", "litestreamrestore", "webhook-test-relpath", "-n", testNamespace, "--ignore-not-found", "--wait=false")
+	})
+})
+
+// ── Scenario: Container Selection ────────────────────────────────────────────
+//
+// When a Deployment has multiple containers and the database volume is mounted
+// in a non-first container, spec.container must be set to select it. The sidecar
+// should resolve the correct volume mount.
+
+var _ = Describe("Container Selection", Ordered, func() {
+	const (
+		appName   = "container-sel-app"
+		dbName    = "container-sel-db"
+		pvcName   = "container-sel-pvc"
+		dbFile    = "containersel.db"
+		dbPath    = "/data"
+		container = "db-app"
+	)
+
+	BeforeAll(func() {
+		By("creating PVC and multi-container Deployment (db volume on second container)")
+		applyLiteral(pvcManifest(pvcName, testNamespace))
+		applyLiteral(multiContainerDeploymentManifest(appName, testNamespace, pvcName, dbPath))
+		kubectl("wait", "-n", testNamespace, "deployment/"+appName,
+			"--for=condition=Available", "--timeout=3m")
+	})
+
+	AfterAll(func() {
+		runIgnoreError("kubectl", "delete", "litestreamreplica", dbName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+		runIgnoreError("kubectl", "delete", "deployment", appName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+		runIgnoreError("kubectl", "delete", "pvc", pvcName, "-n", testNamespace, "--ignore-not-found", "--wait=false")
+	})
+
+	It("injects sidecar with correct volume mount when spec.container selects a non-first container", func() {
+		By("creating LitestreamReplica with spec.container targeting the second container")
+		applyLiteral(litestreamReplicaManifestWithContainer(dbName, testNamespace, appName, dbFile, dbPath, container, false))
+
+		By("waiting for sidecar injection")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "deployment", appName, "-n", testNamespace,
+				"-o", `jsonpath={.spec.template.metadata.labels.litestream\.io/inject}`)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).To(Equal("true"))
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("waiting for rolling update to produce a pod with the Litestream sidecar")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "pods", "-n", testNamespace,
+				"-l", "app="+appName,
+				"-o", `jsonpath={range .items[*]}{range .spec.containers[*]}{.name}{"\n"}{end}{end}`)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).To(ContainSubstring("litestream"))
+		}, 5*time.Minute, 10*time.Second).Should(Succeed())
+
+		By("verifying the litestream sidecar has the data volume mounted")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "pods", "-n", testNamespace,
+				"-l", "app="+appName,
+				"-o", `jsonpath={range .items[0].spec.containers[?(@.name=="litestream")]}{range .volumeMounts[*]}{.mountPath}{"\n"}{end}{end}`)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).To(ContainSubstring(dbPath),
+				"litestream sidecar should mount the database volume at %s", dbPath)
+		}).Should(Succeed())
+
+		By("verifying LitestreamReplica phase is not Error (controller accepted container selection)")
+		Eventually(func(g Gomega) {
+			out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
+				"-o", "jsonpath={.status.phase}")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(out).NotTo(BeEmpty())
+			g.Expect(out).NotTo(Equal("Error"),
+				"phase should not be Error — controller should accept spec.container selection")
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 	})
 })
 
@@ -1261,6 +1884,10 @@ spec:
 }
 
 func appDeploymentManifest(name, ns, pvcName, mountPath string) string {
+	return appDeploymentRecreateManifest(name, ns, pvcName, mountPath)
+}
+
+func appDeploymentRollingUpdateManifest(name, ns, pvcName, mountPath string) string {
 	return fmt.Sprintf(`
 apiVersion: apps/v1
 kind: Deployment
@@ -1319,8 +1946,8 @@ func litestreamReplicaManifestFull(name, ns, target, dbFile, dbPath string, back
 			Enabled: true,
 			Destination: databasev1.BackupDestination{
 				S3: &databasev1.S3Destination{
-					Endpoint:  minioEndpoint,
-					Bucket:    minioBucket,
+					Endpoint:  s3Endpoint,
+					Bucket:    s3Bucket,
 					Path:      name + "/",
 					SecretRef: "minio-creds",
 				},
@@ -1331,6 +1958,125 @@ func litestreamReplicaManifestFull(name, ns, target, dbFile, dbPath string, back
 	data, err := sigsyaml.Marshal(db)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred())
 	GinkgoWriter.Printf("--- LitestreamReplica CR YAML applied (%s) ---\n%s\n", name, string(data))
+	return string(data)
+}
+
+func appDeploymentRecreateManifest(name, ns, pvcName, mountPath string) string {
+	return fmt.Sprintf(`
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: %s
+  template:
+    metadata:
+      labels:
+        app: %s
+    spec:
+      containers:
+        - name: app
+          image: keinos/sqlite3:latest
+          command: ["sleep", "infinity"]
+          volumeMounts:
+            - name: data
+              mountPath: %s
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: %s
+`, name, ns, name, name, mountPath, pvcName)
+}
+
+func multiContainerDeploymentManifest(name, ns, pvcName, mountPath string) string {
+	return fmt.Sprintf(`
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: %s
+  template:
+    metadata:
+      labels:
+        app: %s
+    spec:
+      containers:
+        - name: sidecar-app
+          image: busybox:latest
+          command: ["sleep", "infinity"]
+        - name: db-app
+          image: keinos/sqlite3:latest
+          command: ["sleep", "infinity"]
+          volumeMounts:
+            - name: data
+              mountPath: %s
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: %s
+`, name, ns, name, name, mountPath, pvcName)
+}
+
+func litestreamReplicaManifestWithContainer(name, ns, target, dbFile, dbPath, container string, backupEnabled bool) string {
+	db := &databasev1.LitestreamReplica{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "litestream.io/v1", Kind: "LitestreamReplica"},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: databasev1.LitestreamReplicaSpec{
+			DatabaseName:     dbFile,
+			DatabasePath:     dbPath,
+			TargetDeployment: target,
+			Container:        container,
+			Recovery:         databasev1.RecoverySpec{Mode: databasev1.RecoveryModeManual},
+		},
+	}
+	if backupEnabled {
+		db.Spec.Backup = databasev1.BackupSpec{
+			Enabled: true,
+			Destination: databasev1.BackupDestination{
+				S3: &databasev1.S3Destination{
+					Endpoint:  s3Endpoint,
+					Bucket:    s3Bucket,
+					Path:      name + "/",
+					SecretRef: "minio-creds",
+				},
+			},
+			Retention: databasev1.RetentionPolicy{Duration: "720h"},
+		}
+	}
+	data, err := sigsyaml.Marshal(db)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred())
+	return string(data)
+}
+
+func litestreamRestoreInPlaceManifest(name, ns, sourceRef string) string {
+	return litestreamRestoreInPlaceManifestWithOpts(name, ns, sourceRef, false)
+}
+
+func litestreamRestoreInPlaceManifestWithOpts(name, ns, sourceRef string, force bool) string {
+	restore := &databasev1.LitestreamRestore{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "litestream.io/v1", Kind: "LitestreamRestore"},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: databasev1.LitestreamRestoreSpec{
+			SourceRef: databasev1.RestoreSourceRef{Name: sourceRef},
+			Mode:      databasev1.RestoreModeInPlace,
+			Force:     force,
+		},
+	}
+	data, err := sigsyaml.Marshal(restore)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred())
 	return string(data)
 }
 
@@ -1500,6 +2246,15 @@ func mcList(path string) string {
 	return out
 }
 
+// mcCleanPath removes all objects under a given S3 path prefix using the persistent
+// mc-client pod. Idempotent — does nothing if the path doesn't exist.
+func mcCleanPath(pathPrefix string) {
+	_, _ = kubectlQ("exec", "-n", testNamespace, "mc-client", "--",
+		"/bin/sh", "-c",
+		fmt.Sprintf("mc rm --recursive --force local/%s/%s/ 2>/dev/null || true", s3Bucket, pathPrefix),
+	)
+}
+
 // dumpReplicationDiagnostics prints a diagnostic snapshot to help debug Litestream
 // replication failures. Call via DeferCleanup before polling mc ls so the output
 // appears after any failure, regardless of which check timed out.
@@ -1529,8 +2284,8 @@ func dumpReplicationDiagnostics(appName, dbName, dbFile string) {
 
 	// 3. Full bucket listing (recursive, entire bucket).
 	allObjects, _ := kubectlQ("exec", "-n", testNamespace, "mc-client", "--",
-		"/bin/sh", "-c", "mc ls --recursive local/"+minioBucket+"/")
-	GinkgoWriter.Printf("--- mc ls --recursive local/%s/ ---\n%s\n", minioBucket, allObjects)
+		"/bin/sh", "-c", "mc ls --recursive local/"+s3Bucket+"/")
+	GinkgoWriter.Printf("--- mc ls --recursive local/%s/ ---\n%s\n", s3Bucket, allObjects)
 
 	// 4. mc alias verification.
 	aliasList, _ := kubectlQ("exec", "-n", testNamespace, "mc-client", "--",

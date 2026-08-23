@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,13 +33,16 @@ import (
 const (
 	operatorNamespace = "litestream-operator-system"
 	testNamespace     = "litestream-integration"
+	defaultBucket     = "litestream-backups"
+)
 
-	// MinIO access credentials (used in Secret and Litestream config).
-	minioUser   = "minioadmin"
-	minioPass   = "minioadmin"
-	minioBucket = "litestream-backups"
-	// minioEndpoint is the in-cluster address Litestream uses.
-	minioEndpoint = "minio." + testNamespace + ".svc.cluster.local:9000"
+var (
+	useExternalS3 bool
+	s3AccessKey   string
+	s3SecretKey   string
+	s3Bucket      string
+	s3Endpoint    string // what Litestream pods use (in-cluster DNS or external hostname)
+	mcEndpoint    string // scheme-qualified URL for configuring the mc alias
 )
 
 func TestIntegration(t *testing.T) {
@@ -51,38 +55,70 @@ var _ = BeforeSuite(func() {
 	SetDefaultEventuallyTimeout(5 * time.Minute)
 	SetDefaultEventuallyPollingInterval(5 * time.Second)
 
+	By("detecting S3 backend configuration")
+	if ep := os.Getenv("S3_ENDPOINT"); ep != "" {
+		useExternalS3 = true
+		s3AccessKey = os.Getenv("S3_ACCESS_KEY")
+		s3SecretKey = os.Getenv("S3_SECRET_KEY")
+		Expect(s3AccessKey).NotTo(BeEmpty(), "S3_ACCESS_KEY required when S3_ENDPOINT is set")
+		Expect(s3SecretKey).NotTo(BeEmpty(), "S3_SECRET_KEY required when S3_ENDPOINT is set")
+		s3Bucket = os.Getenv("S3_BUCKET")
+		if s3Bucket == "" {
+			s3Bucket = defaultBucket
+		}
+
+		// Auto-detect scheme for mc alias URL.
+		if strings.HasPrefix(ep, "https://") || strings.HasPrefix(ep, "http://") {
+			mcEndpoint = ep
+			// Litestream s3Endpoint: the controller handles scheme detection,
+			// so pass through as-is (with scheme).
+			s3Endpoint = ep
+		} else {
+			mcEndpoint = "http://" + ep
+			s3Endpoint = ep
+		}
+		_, _ = fmt.Fprintf(GinkgoWriter, "Using external S3 backend: %s (bucket: %s)\n", s3Endpoint, s3Bucket)
+	} else {
+		s3AccessKey = "minioadmin"
+		s3SecretKey = "minioadmin"
+		s3Bucket = defaultBucket
+		s3Endpoint = "minio." + testNamespace + ".svc.cluster.local:9000"
+		mcEndpoint = "http://minio:9000"
+		_, _ = fmt.Fprintf(GinkgoWriter, "Using in-cluster MinIO (bucket: %s)\n", s3Bucket)
+	}
+
 	By("creating test namespace")
-	// --dry-run + apply pattern is idempotent.
-	kubectl("create", "namespace", testNamespace, "--dry-run=client", "-o", "yaml")
 	runIgnoreError("kubectl", "create", "namespace", testNamespace)
 
-	By("deploying MinIO in test namespace")
-	applyLiteral(minioManifest())
+	if !useExternalS3 {
+		By("deploying MinIO in test namespace")
+		applyLiteral(minioManifest())
 
-	By("waiting for MinIO pod to be Running")
-	kubectl("wait", "-n", testNamespace, "deployment/minio",
-		"--for=condition=Available", "--timeout=3m")
+		By("waiting for MinIO pod to be Running")
+		kubectl("wait", "-n", testNamespace, "deployment/minio",
+			"--for=condition=Available", "--timeout=3m")
 
-	By("creating MinIO bucket via mc Job")
-	applyLiteral(createBucketJobManifest())
-	kubectl("wait", "-n", testNamespace, "job/minio-create-bucket",
-		"--for=condition=Complete", "--timeout=2m")
+		By("creating MinIO bucket via mc Job")
+		applyLiteral(createBucketJobManifest())
+		kubectl("wait", "-n", testNamespace, "job/minio-create-bucket",
+			"--for=condition=Complete", "--timeout=2m")
+	}
 
-	By("creating MinIO credentials Secret")
-	runIgnoreError("kubectl", "create", "secret", "generic", "minio-creds",
+	By("creating S3 credentials Secret")
+	runIgnoreError("kubectl", "delete", "secret", "minio-creds", "-n", testNamespace, "--ignore-not-found")
+	kubectl("create", "secret", "generic", "minio-creds",
 		"-n", testNamespace,
-		"--from-literal=ACCESS_KEY_ID="+minioUser,
-		"--from-literal=SECRET_ACCESS_KEY="+minioPass,
+		"--from-literal=ACCESS_KEY_ID="+s3AccessKey,
+		"--from-literal=SECRET_ACCESS_KEY="+s3SecretKey,
 	)
 
 	By("starting persistent mc client pod")
 	applyLiteral(mcClientPodManifest())
 	kubectl("wait", "-n", testNamespace, "pod/mc-client",
 		"--for=condition=Ready", "--timeout=2m")
-	// Pre-configure the mc alias so mcList() calls can skip it.
 	kubectl("exec", "-n", testNamespace, "mc-client", "--",
 		"/bin/sh", "-c",
-		fmt.Sprintf("mc alias set local http://minio:9000 %s %s > /dev/null 2>&1", minioUser, minioPass),
+		fmt.Sprintf("mc alias set local %s %s %s > /dev/null 2>&1", mcEndpoint, s3AccessKey, s3SecretKey),
 	)
 })
 
@@ -209,7 +245,7 @@ spec:
     - name: api
       port: 9000
       targetPort: 9000
-`, testNamespace, testNamespace, minioUser, minioPass, testNamespace)
+`, testNamespace, testNamespace, s3AccessKey, s3SecretKey, testNamespace)
 }
 
 func mcClientPodManifest() string {
@@ -250,5 +286,5 @@ spec:
               mc alias set local http://minio:9000 %s %s
               mc mb --ignore-existing local/%s
               echo "Bucket %s ready"
-`, testNamespace, minioUser, minioPass, minioBucket, minioBucket)
+`, testNamespace, s3AccessKey, s3SecretKey, s3Bucket, s3Bucket)
 }

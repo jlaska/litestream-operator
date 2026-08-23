@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -412,7 +413,12 @@ func (r *LitestreamReplicaReconciler) updateStatus(ctx context.Context, db *data
 		if strategy.Type == "" || strategy.Type == appsv1.RollingUpdateDeploymentStrategyType {
 			isSafe := false
 			if strategy.RollingUpdate != nil && strategy.RollingUpdate.MaxSurge != nil {
-				if strategy.RollingUpdate.MaxSurge.IntValue() == 0 {
+				ms := strategy.RollingUpdate.MaxSurge
+				// IntValue() returns 0 for percentage-based IntOrString (e.g. "25%"),
+				// so check the string value explicitly.
+				if ms.Type == intstr.Int && ms.IntValue() == 0 {
+					isSafe = true
+				} else if ms.Type == intstr.String && ms.StrVal == "0" {
 					isSafe = true
 				}
 			}
