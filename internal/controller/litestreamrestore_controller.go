@@ -25,6 +25,7 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -65,6 +66,7 @@ type LitestreamRestoreReconciler struct {
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
 func (r *LitestreamRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -159,6 +161,11 @@ func (r *LitestreamRestoreReconciler) handleFinalization(ctx context.Context, re
 
 	log.Info("Handling finalization of LitestreamRestore", "phase", restore.Status.Phase)
 
+	// Release the restore lock regardless of phase.
+	if restore.Spec.Mode != databasev1.RestoreModeToPVC {
+		r.releaseRestoreLock(ctx, restore)
+	}
+
 	phase := restore.Status.Phase
 	if restore.Spec.Mode != databasev1.RestoreModeToPVC && sourceDB != nil {
 		isMidRestore := phase == databasev1.RestorePhaseFencing ||
@@ -204,7 +211,6 @@ func (r *LitestreamRestoreReconciler) resolveRestoreTarget(ctx context.Context, 
 	dbPath := sourceDB.Spec.DatabasePath
 	dbFullPath := dbPath + "/" + sourceDB.Spec.DatabaseName
 
-	// Find the volume mount covering the database path in the first container.
 	var podSpec corev1.PodSpec
 	if wt.deployment != nil {
 		podSpec = wt.deployment.Spec.Template.Spec
@@ -216,15 +222,35 @@ func (r *LitestreamRestoreReconciler) resolveRestoreTarget(ctx context.Context, 
 		return "", "", fmt.Errorf("target workload has no containers")
 	}
 
+	// Use explicit container selection when spec.container is set.
+	var targetContainer *corev1.Container
+	if sourceDB.Spec.Container != "" {
+		for i := range podSpec.Containers {
+			if podSpec.Containers[i].Name == sourceDB.Spec.Container {
+				targetContainer = &podSpec.Containers[i]
+				break
+			}
+		}
+		if targetContainer == nil {
+			return "", "", fmt.Errorf("container %q not found in workload pod spec", sourceDB.Spec.Container)
+		}
+	} else {
+		targetContainer = &podSpec.Containers[0]
+	}
+
+	// Find best-matching volume mount (longest prefix).
 	var volumeName string
-	for _, vm := range podSpec.Containers[0].VolumeMounts {
+	var bestLen int
+	for _, vm := range targetContainer.VolumeMounts {
 		if vm.MountPath == dbPath || strings.HasPrefix(dbPath, vm.MountPath+"/") {
-			volumeName = vm.Name
-			break
+			if len(vm.MountPath) > bestLen {
+				volumeName = vm.Name
+				bestLen = len(vm.MountPath)
+			}
 		}
 	}
 	if volumeName == "" {
-		return "", "", fmt.Errorf("no volume mount in container %q covers database path %q", podSpec.Containers[0].Name, dbPath)
+		return "", "", fmt.Errorf("no volume mount in container %q covers database path %q", targetContainer.Name, dbPath)
 	}
 
 	for _, vol := range podSpec.Volumes {
@@ -307,9 +333,75 @@ func (r *LitestreamRestoreReconciler) reconcilePending(ctx context.Context, rest
 		&originalReplicas, &now, nil)
 }
 
-// reconcileAcquiringLock is a placeholder for the restore lock that will be
-// implemented in Phase 3. For now it transitions directly to Fencing.
+// reconcileAcquiringLock acquires a coordination.k8s.io/v1 Lease to ensure only
+// one InPlace restore runs per LitestreamReplica at a time. ToPVC restores skip
+// locking since they don't fence the workload.
 func (r *LitestreamRestoreReconciler) reconcileAcquiringLock(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	// ToPVC restores don't need locking.
+	if restore.Spec.Mode == databasev1.RestoreModeToPVC {
+		return ctrl.Result{RequeueAfter: restoreRequeueInterval}, r.setStatus(ctx, restore,
+			databasev1.RestorePhaseFencing, restore.Status.JobName, "lock not required for ToPVC mode",
+			restore.Status.OriginalReplicas, restore.Status.StartTime, nil)
+	}
+
+	leaseName := "litestream-restore-" + restore.Spec.SourceRef.Name
+
+	lease := &coordinationv1.Lease{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: restore.Namespace, Name: leaseName}, lease)
+
+	if err != nil && !errors.IsNotFound(err) {
+		return ctrl.Result{}, fmt.Errorf("checking restore lock: %w", err)
+	}
+
+	if errors.IsNotFound(err) {
+		now := metav1.NewMicroTime(time.Now())
+		leaseDuration := int32(3600)
+		lease = &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      leaseName,
+				Namespace: restore.Namespace,
+				Labels: map[string]string{
+					"app.kubernetes.io/managed-by": "litestream-operator",
+					restoreLabelKey:                restore.Name,
+				},
+			},
+			Spec: coordinationv1.LeaseSpec{
+				HolderIdentity:       &restore.Name,
+				AcquireTime:          &now,
+				LeaseDurationSeconds: &leaseDuration,
+			},
+		}
+		if setErr := controllerutil.SetControllerReference(restore, lease, r.Scheme); setErr != nil {
+			return ctrl.Result{}, setErr
+		}
+		if createErr := r.Create(ctx, lease); createErr != nil {
+			if errors.IsAlreadyExists(createErr) {
+				return ctrl.Result{RequeueAfter: restoreRequeueInterval}, nil
+			}
+			return ctrl.Result{}, fmt.Errorf("creating restore lock: %w", createErr)
+		}
+
+		log.Info("Acquired restore lock", "lease", leaseName)
+	} else if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != restore.Name {
+		holder := "<unknown>"
+		if lease.Spec.HolderIdentity != nil {
+			holder = *lease.Spec.HolderIdentity
+		}
+		log.Info("Restore lock held by another restore", "holder", holder)
+		setCondition(&restore.Status.Conditions, databasev1.RestoreConditionLocked,
+			metav1.ConditionFalse, "RestoreLocked",
+			fmt.Sprintf("another restore %q holds the lock for LitestreamReplica %q", holder, restore.Spec.SourceRef.Name),
+			restore.Generation, metav1.Now())
+
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, r.setStatus(ctx, restore,
+			databasev1.RestorePhaseAcquiringLock, restore.Status.JobName,
+			fmt.Sprintf("waiting for lock — active restore: %s", holder),
+			restore.Status.OriginalReplicas, restore.Status.StartTime, nil)
+	}
+
+	// Lock acquired — pause replication and transition to Fencing.
 	if err := r.pauseReplication(ctx, sourceDB); err != nil {
 		return ctrl.Result{}, fmt.Errorf("setting pause annotation on LitestreamReplica: %w", err)
 	}
@@ -318,11 +410,11 @@ func (r *LitestreamRestoreReconciler) reconcileAcquiringLock(ctx context.Context
 		"Pausing Litestream replication on LitestreamReplica %s", sourceDB.Name)
 
 	setCondition(&restore.Status.Conditions, databasev1.RestoreConditionLocked,
-		metav1.ConditionTrue, "LockAcquired", "restore lock acquired",
+		metav1.ConditionTrue, "LockAcquired", fmt.Sprintf("acquired lock %s", leaseName),
 		restore.Generation, metav1.Now())
 
 	return ctrl.Result{RequeueAfter: restoreRequeueInterval}, r.setStatus(ctx, restore,
-		databasev1.RestorePhaseFencing, restore.Status.JobName, "fencing application",
+		databasev1.RestorePhaseFencing, restore.Status.JobName, "lock acquired; fencing application",
 		restore.Status.OriginalReplicas, restore.Status.StartTime, nil)
 }
 
@@ -505,6 +597,11 @@ func (r *LitestreamRestoreReconciler) reconcileResuming(ctx context.Context, res
 		}
 	}
 
+	// Release the restore lock before marking complete.
+	if restore.Spec.Mode != databasev1.RestoreModeToPVC {
+		r.releaseRestoreLock(ctx, restore)
+	}
+
 	setCondition(&restore.Status.Conditions, databasev1.RestoreConditionApplicationResumed,
 		metav1.ConditionTrue, "WorkloadScaledUp", "application resumed",
 		restore.Generation, metav1.Now())
@@ -529,6 +626,9 @@ func (r *LitestreamRestoreReconciler) failRestoreWithCleanup(ctx context.Context
 
 	if restore.Spec.Mode != databasev1.RestoreModeToPVC {
 		log.Info("Restore failed; leaving workload fenced for safety — manual intervention required")
+
+		// Release the restore lock so another restore can be attempted.
+		r.releaseRestoreLock(ctx, restore)
 
 		// Remove pause annotation so replication config is restored,
 		// but do NOT scale the workload back up.
@@ -597,6 +697,22 @@ func (r *LitestreamRestoreReconciler) setSkipArchiveCheck(ctx context.Context, d
 		delete(latest.Annotations, databasev1.AnnotationSkipArchiveCheck)
 	}
 	return r.Patch(ctx, latest, patch)
+}
+
+// releaseRestoreLock deletes the Lease used for restore concurrency control.
+// Best-effort: errors are silently ignored.
+func (r *LitestreamRestoreReconciler) releaseRestoreLock(ctx context.Context, restore *databasev1.LitestreamRestore) {
+	leaseName := "litestream-restore-" + restore.Spec.SourceRef.Name
+	lease := &coordinationv1.Lease{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: restore.Namespace,
+		Name:      leaseName,
+	}, lease); err != nil {
+		return
+	}
+	if lease.Spec.HolderIdentity != nil && *lease.Spec.HolderIdentity == restore.Name {
+		_ = r.Delete(ctx, lease)
+	}
 }
 
 // buildRestoreJob constructs the Job that runs `litestream restore`.
@@ -805,6 +921,7 @@ func (r *LitestreamRestoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&databasev1.LitestreamRestore{}).
 		Owns(&batchv1.Job{}).
+		Owns(&coordinationv1.Lease{}).
 		Named("litestreamrestore").
 		Complete(r)
 }

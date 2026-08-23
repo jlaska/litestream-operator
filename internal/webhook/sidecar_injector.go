@@ -152,9 +152,9 @@ const defaultEphemeralStorageLimit = "1Gi"
 
 // inject mutates the pod spec in-place to add the Litestream sidecar.
 func (s *SidecarInjector) inject(pod *corev1.Pod, db *databasev1.LitestreamReplica) error {
-	// The sidecar shares the volume that already mounts the database path.
-	// We look for a volume mount in the first container that covers databasePath.
-	volumeName, err := s.findVolumeForPath(pod, db.Spec.DatabasePath)
+	// Resolve the volume mount covering the database path, using explicit
+	// container selection when spec.container is set.
+	mount, err := s.findVolumeForPath(pod, db.Spec.DatabasePath, db.Spec.Container)
 	if err != nil {
 		return err
 	}
@@ -162,6 +162,14 @@ func (s *SidecarInjector) inject(pod *corev1.Pod, db *databasev1.LitestreamRepli
 	image := db.Spec.Image
 	if image == "" {
 		image = litestreamDefaultImage
+	}
+
+	sidecarDataMount := corev1.VolumeMount{
+		Name:      mount.volumeName,
+		MountPath: mount.mountPath,
+	}
+	if mount.subPath != "" {
+		sidecarDataMount.SubPath = mount.subPath
 	}
 
 	sidecar := corev1.Container{
@@ -172,10 +180,7 @@ func (s *SidecarInjector) inject(pod *corev1.Pod, db *databasev1.LitestreamRepli
 			{Name: "metrics", ContainerPort: 9090, Protocol: corev1.ProtocolTCP},
 		},
 		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      volumeName,
-				MountPath: db.Spec.DatabasePath,
-			},
+			sidecarDataMount,
 			{
 				Name:      litestreamConfigVolume,
 				MountPath: litestreamConfigMount,
@@ -232,15 +237,15 @@ func (s *SidecarInjector) inject(pod *corev1.Pod, db *databasev1.LitestreamRepli
 	if db.Spec.Backup.Enabled {
 		skipArchive := db.Annotations[databasev1.AnnotationSkipArchiveCheck] == "true"
 		if db.Spec.Recovery.Mode == databasev1.RecoveryModeAutomatic {
-			s.injectAutoRestoreContainer(pod, db, volumeName)
+			s.injectAutoRestoreContainer(pod, db, mount)
 		} else if !skipArchive {
-			s.injectArchiveCheckContainer(pod, db, volumeName)
+			s.injectArchiveCheckContainer(pod, db, mount)
 		}
 	}
 
 	// Inject the bootstrap SQL init container when Bootstrap.SQL is configured.
 	if db.Spec.Bootstrap.SQL != "" {
-		s.injectBootstrapContainer(pod, db, volumeName)
+		s.injectBootstrapContainer(pod, db, mount)
 	}
 
 	return nil
@@ -266,14 +271,21 @@ const autoRestoreContainerName = "litestream-restore"
 // buildLitestreamInitContainer builds the shared container structure for both
 // the archive-check and auto-restore init containers. Both containers use the
 // same image, env vars, and volume mounts; only the name and script differ.
-func buildLitestreamInitContainer(name, script, image, dbPath, dataVolumeName string, envVars []corev1.EnvVar, runAsUser, runAsGroup *int64) corev1.Container {
+func buildLitestreamInitContainer(name, script, image string, mount resolvedMount, envVars []corev1.EnvVar, runAsUser, runAsGroup *int64) corev1.Container {
+	dataMount := corev1.VolumeMount{
+		Name:      mount.volumeName,
+		MountPath: mount.mountPath,
+	}
+	if mount.subPath != "" {
+		dataMount.SubPath = mount.subPath
+	}
 	c := corev1.Container{
 		Name:    name,
 		Image:   image,
 		Command: []string{"sh", "-c", script},
 		Env:     envVars,
 		VolumeMounts: []corev1.VolumeMount{
-			{Name: dataVolumeName, MountPath: dbPath},
+			dataMount,
 			{Name: litestreamConfigVolume, MountPath: litestreamConfigMount, ReadOnly: true},
 		},
 	}
@@ -301,7 +313,7 @@ func buildLitestreamInitContainer(name, script, image, dbPath, dataVolumeName st
 //
 // This mirrors CNPG's "empty WAL archive check" pattern. The check runs before the app
 // starts, so there is no race with app DB initialization.
-func (s *SidecarInjector) injectArchiveCheckContainer(pod *corev1.Pod, db *databasev1.LitestreamReplica, dataVolumeName string) {
+func (s *SidecarInjector) injectArchiveCheckContainer(pod *corev1.Pod, db *databasev1.LitestreamReplica, mount resolvedMount) {
 	image := db.Spec.Image
 	if image == "" {
 		image = litestreamDefaultImage
@@ -384,7 +396,7 @@ exit 0
 		envVars = s3CredsEnvVars(db.Spec.Backup.Destination.S3.SecretRef)
 	}
 
-	c := buildLitestreamInitContainer(archiveCheckContainerName, script, image, db.Spec.DatabasePath, dataVolumeName, envVars, db.Spec.RunAsUser, db.Spec.RunAsGroup)
+	c := buildLitestreamInitContainer(archiveCheckContainerName, script, image, mount, envVars, db.Spec.RunAsUser, db.Spec.RunAsGroup)
 	pod.Spec.InitContainers = append([]corev1.Container{c}, pod.Spec.InitContainers...)
 }
 
@@ -396,7 +408,7 @@ exit 0
 // This replaces the archive-check container when recovery.mode=Automatic.
 // Any genuine restore failure (bad credentials, network, corruption) exits non-zero
 // and blocks pod startup — the operator never silently starts fresh.
-func (s *SidecarInjector) injectAutoRestoreContainer(pod *corev1.Pod, db *databasev1.LitestreamReplica, dataVolumeName string) {
+func (s *SidecarInjector) injectAutoRestoreContainer(pod *corev1.Pod, db *databasev1.LitestreamReplica, mount resolvedMount) {
 	image := db.Spec.Image
 	if image == "" {
 		image = litestreamDefaultImage
@@ -436,7 +448,7 @@ exit 0
 		envVars = s3CredsEnvVars(db.Spec.Backup.Destination.S3.SecretRef)
 	}
 
-	c := buildLitestreamInitContainer(autoRestoreContainerName, script, image, db.Spec.DatabasePath, dataVolumeName, envVars, db.Spec.RunAsUser, db.Spec.RunAsGroup)
+	c := buildLitestreamInitContainer(autoRestoreContainerName, script, image, mount, envVars, db.Spec.RunAsUser, db.Spec.RunAsGroup)
 	pod.Spec.InitContainers = append([]corev1.Container{c}, pod.Spec.InitContainers...)
 }
 
@@ -467,7 +479,7 @@ func s3CredsEnvVars(secretRef string) []corev1.EnvVar {
 // injectBootstrapContainer adds an init container that applies bootstrap SQL
 // only when the database is genuinely new (no DB file exists after the
 // archive-check/auto-restore init container has run).
-func (s *SidecarInjector) injectBootstrapContainer(pod *corev1.Pod, db *databasev1.LitestreamReplica, dataVolumeName string) {
+func (s *SidecarInjector) injectBootstrapContainer(pod *corev1.Pod, db *databasev1.LitestreamReplica, mount resolvedMount) {
 	bootstrapImage := db.Spec.Bootstrap.Image
 	if bootstrapImage == "" {
 		bootstrapImage = "keinos/sqlite3:latest"
@@ -486,15 +498,19 @@ sqlite3 "${DB_PATH}" < /bootstrap/bootstrap.sql
 echo "db-bootstrap: bootstrap SQL applied"
 `, dbFullPath)
 
+	dataMount := corev1.VolumeMount{
+		Name:      mount.volumeName,
+		MountPath: mount.mountPath,
+	}
+	if mount.subPath != "" {
+		dataMount.SubPath = mount.subPath
+	}
 	bootstrapContainer := corev1.Container{
 		Name:    dbBootstrapContainerName,
 		Image:   bootstrapImage,
 		Command: []string{"sh", "-c", script},
 		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      dataVolumeName,
-				MountPath: db.Spec.DatabasePath,
-			},
+			dataMount,
 			{
 				Name:      dbBootstrapSQLVolume,
 				MountPath: "/bootstrap",
@@ -523,24 +539,58 @@ echo "db-bootstrap: bootstrap SQL applied"
 	})
 }
 
-// findVolumeForPath returns the name of a volume whose mount path in the first
-// application container covers the given database path. Returns an error if
-// none is found — the operator requires the app to mount its data volume
-// explicitly so that Litestream can share it.
-func (s *SidecarInjector) findVolumeForPath(pod *corev1.Pod, dbPath string) (string, error) {
+// resolvedMount holds the resolved volume mount information for the database path.
+type resolvedMount struct {
+	volumeName string
+	mountPath  string
+	subPath    string
+}
+
+// findVolumeForPath resolves the volume mount covering the database path.
+// When containerName is set, it searches that specific container; otherwise
+// it uses the first container. Returns the best (longest-prefix) match.
+func (s *SidecarInjector) findVolumeForPath(pod *corev1.Pod, dbPath, containerName string) (resolvedMount, error) {
 	if len(pod.Spec.Containers) == 0 {
-		return "", fmt.Errorf("pod has no containers")
+		return resolvedMount{}, fmt.Errorf("pod has no containers")
 	}
 
-	for _, vm := range pod.Spec.Containers[0].VolumeMounts {
+	var targetContainer *corev1.Container
+	if containerName != "" {
+		for i := range pod.Spec.Containers {
+			if pod.Spec.Containers[i].Name == containerName {
+				targetContainer = &pod.Spec.Containers[i]
+				break
+			}
+		}
+		if targetContainer == nil {
+			return resolvedMount{}, fmt.Errorf("container %q not found in pod spec", containerName)
+		}
+	} else {
+		targetContainer = &pod.Spec.Containers[0]
+	}
+
+	var bestMatch *corev1.VolumeMount
+	var bestLen int
+	for i := range targetContainer.VolumeMounts {
+		vm := &targetContainer.VolumeMounts[i]
 		if vm.MountPath == dbPath || strings.HasPrefix(dbPath, vm.MountPath+"/") {
-			return vm.Name, nil
+			if len(vm.MountPath) > bestLen {
+				bestMatch = vm
+				bestLen = len(vm.MountPath)
+			}
 		}
 	}
+	if bestMatch == nil {
+		return resolvedMount{}, fmt.Errorf(
+			"no volume mount in container %q covers database path %q; "+
+				"ensure the application mounts a volume at %q",
+			targetContainer.Name, dbPath, dbPath,
+		)
+	}
 
-	return "", fmt.Errorf(
-		"no volume mount in container %q covers database path %q; "+
-			"ensure the application mounts a volume at %q",
-		pod.Spec.Containers[0].Name, dbPath, dbPath,
-	)
+	return resolvedMount{
+		volumeName: bestMatch.Name,
+		mountPath:  bestMatch.MountPath,
+		subPath:    bestMatch.SubPath,
+	}, nil
 }

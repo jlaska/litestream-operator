@@ -21,6 +21,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -476,6 +479,32 @@ func (r *LitestreamReplicaReconciler) updateStatus(ctx context.Context, db *data
 		}
 		setCondition(&db.Status.Conditions, databasev1.ConditionSidecarReady,
 			condStatus, sidecarReason, msg, db.Generation, now)
+
+		// Refine replication health with actual metrics when configured.
+		if healthy && db.Spec.Health.MaxReplicationLag != "" {
+			maxLag, parseErr := time.ParseDuration(db.Spec.Health.MaxReplicationLag)
+			if parseErr == nil {
+				lastSync, scrapeErr := r.scrapeReplicationLag(ctx, db, wt)
+				if scrapeErr == nil {
+					lag := time.Since(lastSync)
+					syncTime := metav1.NewTime(lastSync)
+					db.Status.LastSuccessfulReplicationTime = &syncTime
+					db.Status.ReplicationLag = lag.Truncate(time.Second).String()
+
+					if lag > maxLag {
+						condStatus = metav1.ConditionFalse
+						replicationReason = "ReplicationLagExceeded"
+						msg = fmt.Sprintf("replication lag %s exceeds threshold %s",
+							lag.Truncate(time.Second), maxLag)
+						db.Status.BackupHealthy = false
+					}
+				} else {
+					logf.FromContext(ctx).V(1).Info("metrics scrape failed; using container state as health signal",
+						"error", scrapeErr)
+				}
+			}
+		}
+
 		setCondition(&db.Status.Conditions, databasev1.ConditionReplicationHealthy,
 			condStatus, replicationReason, msg, db.Generation, now)
 
@@ -535,6 +564,70 @@ func (r *LitestreamReplicaReconciler) updateStatus(ctx context.Context, db *data
 	}
 
 	return r.Status().Patch(ctx, db, patch)
+}
+
+// scrapeReplicationLag finds a running pod with the Litestream sidecar and scrapes
+// the /metrics endpoint for litestream_replica_last_sync_seconds. Returns the
+// timestamp of the last successful sync. This is best-effort: it requires
+// in-cluster connectivity to pod IPs.
+func (r *LitestreamReplicaReconciler) scrapeReplicationLag(ctx context.Context, db *databasev1.LitestreamReplica, wt *workloadTarget) (time.Time, error) {
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList,
+		client.InNamespace(db.Namespace),
+		client.MatchingLabels(wt.selectorLabels()),
+	); err != nil {
+		return time.Time{}, fmt.Errorf("listing pods: %w", err)
+	}
+
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.Status.PodIP == "" {
+			continue
+		}
+		for _, cs := range pod.Status.ContainerStatuses {
+			if cs.Name == litestreamSidecar && cs.State.Running != nil {
+				return r.fetchLastSyncTime(ctx, pod.Status.PodIP)
+			}
+		}
+	}
+	return time.Time{}, fmt.Errorf("no running pod with Litestream sidecar found")
+}
+
+// fetchLastSyncTime scrapes the Prometheus metrics endpoint at the given pod IP
+// and extracts litestream_replica_last_sync_seconds.
+func (r *LitestreamReplicaReconciler) fetchLastSyncTime(ctx context.Context, podIP string) (time.Time, error) {
+	url := fmt.Sprintf("http://%s:9090/metrics", podIP)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.HasPrefix(line, "#") || !strings.Contains(line, "litestream_replica_last_sync_seconds") {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			ts, parseErr := strconv.ParseFloat(parts[len(parts)-1], 64)
+			if parseErr != nil {
+				continue
+			}
+			return time.Unix(int64(ts), int64((ts-float64(int64(ts)))*1e9)), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("litestream_replica_last_sync_seconds metric not found")
 }
 
 // archiveCheckState inspects pods to detect whether the archive-check init container

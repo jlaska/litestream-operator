@@ -1298,6 +1298,228 @@ var _ = Describe("SidecarInjector error paths", func() {
 	})
 })
 
+var _ = Describe("SidecarInjector container selection and subPath", func() {
+	const (
+		namespace         = "default"
+		csDBName          = "cs-test-db"
+		csDeployName      = "cs-test-app"
+		csDatabaseName    = "app.db"
+		csDatabasePath    = "/data"
+		csVolumeName      = "cs-data"
+		appContainerImage = "busybox" // goconst
+		injectTrue        = "true"    // goconst
+	)
+
+	ctx := context.Background()
+
+	newInjector := func() *webhook.SidecarInjector {
+		return &webhook.SidecarInjector{
+			Client:  k8sClient,
+			Decoder: admission.NewDecoder(k8sClient.Scheme()),
+		}
+	}
+
+	makeRequest := func(pod *corev1.Pod) admission.Request {
+		raw, err := json.Marshal(pod)
+		Expect(err).NotTo(HaveOccurred())
+		return admission.Request{
+			AdmissionRequest: admissionv1.AdmissionRequest{
+				UID: "test-uid", Namespace: namespace,
+				Operation: admissionv1.Create,
+				Object:    runtime.RawExtension{Raw: raw},
+			},
+		}
+	}
+
+	AfterEach(func() {
+		db := &databasev1.LitestreamReplica{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: csDBName, Namespace: namespace}, db); err == nil {
+			_ = k8sClient.Delete(ctx, db)
+		}
+	})
+
+	It("selects the second container when spec.container is set", func() {
+		db := &databasev1.LitestreamReplica{
+			ObjectMeta: metav1.ObjectMeta{Name: csDBName, Namespace: namespace},
+			Spec: databasev1.LitestreamReplicaSpec{
+				DatabaseName:     csDatabaseName,
+				DatabasePath:     csDatabasePath,
+				TargetDeployment: csDeployName,
+				Container:        "second",
+			},
+		}
+		Expect(k8sClient.Create(ctx, db)).To(Succeed())
+
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "cs-pod", Namespace: namespace,
+				Annotations: map[string]string{
+					databasev1.AnnotationInject: injectTrue,
+					databasev1.AnnotationConfig: namespace + "/" + csDBName,
+				},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name: "first", Image: appContainerImage,
+						VolumeMounts: []corev1.VolumeMount{{Name: "other-vol", MountPath: "/other"}},
+					},
+					{
+						Name: "second", Image: appContainerImage,
+						VolumeMounts: []corev1.VolumeMount{{Name: csVolumeName, MountPath: csDatabasePath}},
+					},
+				},
+				Volumes: []corev1.Volume{
+					{Name: "other-vol", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+					{Name: csVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+				},
+			},
+		}
+		resp := newInjector().Handle(ctx, makeRequest(pod))
+		Expect(resp.Allowed).To(BeTrue())
+
+		patched := applyAllPatches(pod, resp.Patches)
+		var sidecar corev1.Container
+		for _, c := range patched.Spec.Containers {
+			if c.Name == "litestream" {
+				sidecar = c
+				break
+			}
+		}
+		Expect(sidecar.Name).To(Equal("litestream"))
+		Expect(sidecar.VolumeMounts[0].Name).To(Equal(csVolumeName))
+	})
+
+	It("preserves subPath from the application volume mount", func() {
+		db := &databasev1.LitestreamReplica{
+			ObjectMeta: metav1.ObjectMeta{Name: csDBName, Namespace: namespace},
+			Spec: databasev1.LitestreamReplicaSpec{
+				DatabaseName:     csDatabaseName,
+				DatabasePath:     csDatabasePath,
+				TargetDeployment: csDeployName,
+			},
+		}
+		Expect(k8sClient.Create(ctx, db)).To(Succeed())
+
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "subpath-pod", Namespace: namespace,
+				Annotations: map[string]string{
+					databasev1.AnnotationInject: injectTrue,
+					databasev1.AnnotationConfig: namespace + "/" + csDBName,
+				},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name: "app", Image: appContainerImage,
+					VolumeMounts: []corev1.VolumeMount{{
+						Name: csVolumeName, MountPath: csDatabasePath, SubPath: "db-subdir",
+					}},
+				}},
+				Volumes: []corev1.Volume{{
+					Name:         csVolumeName,
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				}},
+			},
+		}
+		resp := newInjector().Handle(ctx, makeRequest(pod))
+		Expect(resp.Allowed).To(BeTrue())
+
+		patched := applyAllPatches(pod, resp.Patches)
+		var sidecar corev1.Container
+		for _, c := range patched.Spec.Containers {
+			if c.Name == "litestream" {
+				sidecar = c
+				break
+			}
+		}
+		Expect(sidecar.VolumeMounts[0].SubPath).To(Equal("db-subdir"))
+	})
+
+	It("returns an error when spec.container references a nonexistent container", func() {
+		db := &databasev1.LitestreamReplica{
+			ObjectMeta: metav1.ObjectMeta{Name: csDBName, Namespace: namespace},
+			Spec: databasev1.LitestreamReplicaSpec{
+				DatabaseName:     csDatabaseName,
+				DatabasePath:     csDatabasePath,
+				TargetDeployment: csDeployName,
+				Container:        "nonexistent",
+			},
+		}
+		Expect(k8sClient.Create(ctx, db)).To(Succeed())
+
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "bad-container-pod", Namespace: namespace,
+				Annotations: map[string]string{
+					databasev1.AnnotationInject: injectTrue,
+					databasev1.AnnotationConfig: namespace + "/" + csDBName,
+				},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name: "app", Image: appContainerImage,
+					VolumeMounts: []corev1.VolumeMount{{Name: csVolumeName, MountPath: csDatabasePath}},
+				}},
+				Volumes: []corev1.Volume{{
+					Name:         csVolumeName,
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				}},
+			},
+		}
+		resp := newInjector().Handle(ctx, makeRequest(pod))
+		Expect(resp.Allowed).To(BeFalse())
+		Expect(resp.Result.Code).To(BeNumerically("==", 500))
+	})
+
+	It("selects the best (longest prefix) volume mount", func() {
+		db := &databasev1.LitestreamReplica{
+			ObjectMeta: metav1.ObjectMeta{Name: csDBName, Namespace: namespace},
+			Spec: databasev1.LitestreamReplicaSpec{
+				DatabaseName:     csDatabaseName,
+				DatabasePath:     "/data/nested",
+				TargetDeployment: csDeployName,
+			},
+		}
+		Expect(k8sClient.Create(ctx, db)).To(Succeed())
+
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "nested-pod", Namespace: namespace,
+				Annotations: map[string]string{
+					databasev1.AnnotationInject: injectTrue,
+					databasev1.AnnotationConfig: namespace + "/" + csDBName,
+				},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name: "app", Image: appContainerImage,
+					VolumeMounts: []corev1.VolumeMount{
+						{Name: "root-vol", MountPath: "/data"},
+						{Name: "nested-vol", MountPath: "/data/nested"},
+					},
+				}},
+				Volumes: []corev1.Volume{
+					{Name: "root-vol", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+					{Name: "nested-vol", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+				},
+			},
+		}
+		resp := newInjector().Handle(ctx, makeRequest(pod))
+		Expect(resp.Allowed).To(BeTrue())
+
+		patched := applyAllPatches(pod, resp.Patches)
+		var sidecar corev1.Container
+		for _, c := range patched.Spec.Containers {
+			if c.Name == "litestream" {
+				sidecar = c
+				break
+			}
+		}
+		Expect(sidecar.VolumeMounts[0].Name).To(Equal("nested-vol"))
+	})
+})
+
 var _ = Describe("SidecarInjector SecurityContext from runAsUser/runAsGroup", func() {
 	const (
 		namespace         = "default"

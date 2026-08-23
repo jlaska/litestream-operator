@@ -207,6 +207,13 @@ spec:
                       when it is genuinely new. Use IF NOT EXISTS guards for safety.
                     type: string
                 type: object
+              container:
+                description: |-
+                  Container is the name of the application container that mounts the database
+                  volume. When empty, the first container in the pod spec is used.
+                  Set this when the pod has multiple containers and the database volume is
+                  not mounted in the first one.
+                type: string
               databaseName:
                 description: DatabaseName is the filename of the SQLite database (e.g.
                   "paperless.db").
@@ -217,6 +224,18 @@ spec:
                   the database file lives (e.g. "/data"). The Litestream sidecar will be
                   configured to watch DatabasePath/DatabaseName.
                 type: string
+              health:
+                description: Health configures backup health thresholds and SLOs.
+                properties:
+                  maxReplicationLag:
+                    description: |-
+                      MaxReplicationLag is the maximum acceptable time since the last successful
+                      replication sync. When exceeded, ReplicationHealthy becomes False.
+                      Expressed as a Go duration string (e.g. "5m", "1h").
+                      When empty, no lag-based health check is performed and health is
+                      inferred from sidecar container state only.
+                    type: string
+                type: object
               image:
                 default: litestream/litestream:0.5.14
                 description: Image overrides the Litestream container image used for
@@ -340,9 +359,10 @@ spec:
                   InjectedSpecHash is the hash of the injection-relevant spec fields currently
                   applied to the target workload's pod template.
                 type: string
-              lastBackup:
-                description: LastBackup is the timestamp of the most recent successful
-                  backup.
+              lastSuccessfulReplicationTime:
+                description: |-
+                  LastSuccessfulReplicationTime is the timestamp of the most recent successful
+                  replication sync, as reported by Litestream metrics.
                 format: date-time
                 type: string
               observedGeneration:
@@ -359,8 +379,8 @@ spec:
                   output.
                 type: boolean
               replicationLag:
-                description: ReplicationLag is the approximate lag reported by Litestream
-                  (human-readable).
+                description: ReplicationLag is the duration since the last successful
+                  sync (human-readable).
                 type: string
             type: object
         type: object

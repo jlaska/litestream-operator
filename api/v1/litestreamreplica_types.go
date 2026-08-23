@@ -126,6 +126,16 @@ type BootstrapSpec struct {
 	Image string `json:"image,omitempty"`
 }
 
+// HealthSpec configures backup health thresholds.
+type HealthSpec struct {
+	// MaxReplicationLag is the maximum acceptable time since the last successful
+	// replication sync. When exceeded, ReplicationHealthy becomes False.
+	// Expressed as a Go duration string (e.g. "5m", "1h").
+	// When empty, no lag-based health check is performed and health is
+	// inferred from sidecar container state only.
+	MaxReplicationLag string `json:"maxReplicationLag,omitempty"`
+}
+
 // LitestreamReplicaSpec defines the desired state of LitestreamReplica.
 type LitestreamReplicaSpec struct {
 	// DatabaseName is the filename of the SQLite database (e.g. "paperless.db").
@@ -148,6 +158,13 @@ type LitestreamReplicaSpec struct {
 	// Mutually exclusive with TargetDeployment.
 	TargetStatefulSet string `json:"targetStatefulSet,omitempty"`
 
+	// Container is the name of the application container that mounts the database
+	// volume. When empty, the first container in the pod spec is used.
+	// Set this when the pod has multiple containers and the database volume is
+	// not mounted in the first one.
+	// +optional
+	Container string `json:"container,omitempty"`
+
 	// Image overrides the Litestream container image used for the sidecar.
 	// +kubebuilder:default="litestream/litestream:0.5.14"
 	Image string `json:"image,omitempty"`
@@ -158,6 +175,9 @@ type LitestreamReplicaSpec struct {
 	// Recovery configures startup recovery behavior when the local database
 	// is missing or inconsistent with the remote archive.
 	Recovery RecoverySpec `json:"recovery,omitempty"`
+
+	// Health configures backup health thresholds and SLOs.
+	Health HealthSpec `json:"health,omitempty"`
 
 	// Bootstrap defines SQL to execute only when the database is genuinely new
 	// (no local DB file AND no remote archive). Applications should own schema
@@ -256,10 +276,11 @@ type LitestreamReplicaStatus struct {
 	// BackupHealthy indicates the last backup/replication check succeeded.
 	BackupHealthy bool `json:"backupHealthy,omitempty"`
 
-	// LastBackup is the timestamp of the most recent successful backup.
-	LastBackup *metav1.Time `json:"lastBackup,omitempty"`
+	// LastSuccessfulReplicationTime is the timestamp of the most recent successful
+	// replication sync, as reported by Litestream metrics.
+	LastSuccessfulReplicationTime *metav1.Time `json:"lastSuccessfulReplicationTime,omitempty"`
 
-	// ReplicationLag is the approximate lag reported by Litestream (human-readable).
+	// ReplicationLag is the duration since the last successful sync (human-readable).
 	ReplicationLag string `json:"replicationLag,omitempty"`
 
 	// InjectedSpecHash is the hash of the injection-relevant spec fields currently
