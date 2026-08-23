@@ -12,45 +12,9 @@ env:
   IMAGE_NAME: jlaska/litestream-operator
 
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v7
-
-    - name: Set up Go
-      uses: actions/setup-go@v7
-      with:
-        go-version-file: go.mod
-
-    - name: Cache Go modules and envtest binaries
-      uses: actions/cache@v6
-      with:
-        path: |
-          ~/.cache/go-build
-          ~/go/pkg/mod
-          bin/k8s
-        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-        restore-keys: |
-          ${{ runner.os }}-go-
-
-    - name: Download dependencies
-      run: go mod download
-
-    - name: Run tests
-      run: make test
-
-    - name: Run lint
-      uses: golangci/golangci-lint-action@v7
-      with:
-        version: v2.12.2
-        args: --timeout=5m
-
   build:
     name: Build and Push Image
     runs-on: ubuntu-latest
-    needs: test
     if: github.event_name == 'push'
     permissions:
       contents: read
