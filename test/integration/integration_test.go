@@ -1649,10 +1649,10 @@ var _ = Describe("Injection Spec Hash Rollout", Ordered, func() {
 
 var _ = Describe("Unsafe Rollout Strategy", Ordered, func() {
 	const (
-		appName = "rollout-strat-app"
-		dbName  = "rollout-strat-db"
-		pvcName = "rollout-strat-pvc"
-		dbFile  = "rolloutstrat.db"
+		appName = "unsafe-rollout-app"
+		dbName  = "unsafe-rollout-db"
+		pvcName = "unsafe-rollout-pvc"
+		dbFile  = "unsaferollout.db"
 		dbPath  = "/data"
 	)
 
@@ -2061,9 +2061,6 @@ func litestreamReplicaManifestWithContainer(name, ns, target, dbFile, dbPath, co
 	return string(data)
 }
 
-func litestreamRestoreInPlaceManifest(name, ns, sourceRef string) string {
-	return litestreamRestoreInPlaceManifestWithOpts(name, ns, sourceRef, false)
-}
 
 func litestreamRestoreInPlaceManifestWithOpts(name, ns, sourceRef string, force bool) string {
 	restore := &databasev1.LitestreamRestore{

@@ -409,31 +409,17 @@ func (r *LitestreamReplicaReconciler) updateStatus(ctx context.Context, db *data
 
 	// --- Rollout strategy guard: prevent concurrent writers ---
 	if wt.deployment != nil {
-		strategy := wt.deployment.Spec.Strategy
-		if strategy.Type == "" || strategy.Type == appsv1.RollingUpdateDeploymentStrategyType {
-			isSafe := false
-			if strategy.RollingUpdate != nil && strategy.RollingUpdate.MaxSurge != nil {
-				ms := strategy.RollingUpdate.MaxSurge
-				// IntValue() returns 0 for percentage-based IntOrString (e.g. "25%"),
-				// so check the string value explicitly.
-				if ms.Type == intstr.Int && ms.IntValue() == 0 {
-					isSafe = true
-				} else if ms.Type == intstr.String && ms.StrVal == "0" {
-					isSafe = true
-				}
-			}
-			if !isSafe {
-				db.Status.Phase = databasev1.PhaseError
-				db.Status.Ready = false
-				setCondition(&db.Status.Conditions, databasev1.ConditionUnsafeRolloutStrategy,
-					metav1.ConditionTrue, "UnsafeRolloutStrategy",
-					fmt.Sprintf("target Deployment %q uses RollingUpdate strategy which can temporarily run two pods; "+
-						"use Recreate or RollingUpdate with maxSurge=0 for single-writer SQLite safety", wt.name()),
-					db.Generation, now)
-				r.Recorder.Eventf(db, corev1.EventTypeWarning, "UnsafeRolloutStrategy",
-					"target Deployment %q uses unsafe rollout strategy for single-writer SQLite", wt.name())
-				return r.Status().Patch(ctx, db, patch)
-			}
+		if !isRolloutStrategySafe(wt.deployment) {
+			db.Status.Phase = databasev1.PhaseError
+			db.Status.Ready = false
+			setCondition(&db.Status.Conditions, databasev1.ConditionUnsafeRolloutStrategy,
+				metav1.ConditionTrue, "UnsafeRolloutStrategy",
+				fmt.Sprintf("target Deployment %q uses RollingUpdate strategy which can temporarily run two pods; "+
+					"use Recreate or RollingUpdate with maxSurge=0 for single-writer SQLite safety", wt.name()),
+				db.Generation, now)
+			r.Recorder.Eventf(db, corev1.EventTypeWarning, "UnsafeRolloutStrategy",
+				"target Deployment %q uses unsafe rollout strategy for single-writer SQLite", wt.name())
+			return r.Status().Patch(ctx, db, patch)
 		}
 		meta.RemoveStatusCondition(&db.Status.Conditions, databasev1.ConditionUnsafeRolloutStrategy)
 	}
@@ -570,6 +556,23 @@ func (r *LitestreamReplicaReconciler) updateStatus(ctx context.Context, db *data
 	}
 
 	return r.Status().Patch(ctx, db, patch)
+}
+
+// isRolloutStrategySafe returns true if the Deployment's rollout strategy
+// cannot produce concurrent writers (Recreate, or RollingUpdate with maxSurge=0).
+func isRolloutStrategySafe(deploy *appsv1.Deployment) bool {
+	strategy := deploy.Spec.Strategy
+	if strategy.Type != "" && strategy.Type != appsv1.RollingUpdateDeploymentStrategyType {
+		return true
+	}
+	if strategy.RollingUpdate == nil || strategy.RollingUpdate.MaxSurge == nil {
+		return false
+	}
+	ms := strategy.RollingUpdate.MaxSurge
+	if ms.Type == intstr.Int && ms.IntValue() == 0 {
+		return true
+	}
+	return ms.Type == intstr.String && ms.StrVal == "0"
 }
 
 // scrapeReplicationLag finds a running pod with the Litestream sidecar and scrapes
