@@ -867,12 +867,17 @@ func (r *LitestreamRestoreReconciler) restoreJobPodLogs(ctx context.Context, nam
 	}
 	pod := podList.Items[0]
 	tail := int64(30)
-	req := r.KubeClient.CoreV1().Pods(namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+	opts := &corev1.PodLogOptions{
 		TailLines: &tail,
-	})
-	stream, err := req.Stream(ctx)
+		Container: "litestream-restore",
+	}
+	stream, err := r.KubeClient.CoreV1().Pods(namespace).GetLogs(pod.Name, opts).Stream(ctx)
 	if err != nil {
-		return ""
+		opts.Previous = true
+		stream, err = r.KubeClient.CoreV1().Pods(namespace).GetLogs(pod.Name, opts).Stream(ctx)
+		if err != nil {
+			return ""
+		}
 	}
 	defer func() { _ = stream.Close() }()
 	b, err := io.ReadAll(stream)

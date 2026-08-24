@@ -495,6 +495,7 @@ if [ -f "${DB_PATH}" ]; then
 fi
 echo "db-bootstrap: database is genuinely new, applying bootstrap SQL"
 sqlite3 "${DB_PATH}" < /bootstrap/bootstrap.sql
+chmod 666 "${DB_PATH}"
 echo "db-bootstrap: bootstrap SQL applied"
 `, dbFullPath)
 

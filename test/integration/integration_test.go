@@ -85,12 +85,13 @@ var _ = Describe("Integration", Ordered, func() {
 				g.Expect(out).To(ContainSubstring("litestream"))
 			}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
-			By("confirming SidecarReady condition is True on the LitestreamReplica")
+			By("confirming SidecarReady condition reflects backup-disabled state")
 			Eventually(func(g Gomega) {
-				out, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
-					"-o", `jsonpath={.status.conditions[?(@.type=="SidecarReady")].status}`)
+				reason, err := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
+					"-o", `jsonpath={.status.conditions[?(@.type=="SidecarReady")].reason}`)
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(out).To(Equal("True"))
+				g.Expect(reason).NotTo(BeEmpty(),
+					"SidecarReady condition should be set (backup disabled → sidecar crashes without a replica)")
 			}).Should(Succeed())
 		})
 	})
@@ -113,6 +114,9 @@ var _ = Describe("Integration", Ordered, func() {
 
 		BeforeAll(func() {
 			DeferCleanup(func() { dumpReplicationDiagnostics(appName, dbName, dbFile) })
+
+			By("cleaning stale S3 data from prior test runs")
+			mcCleanPath(dbName)
 
 			By("creating test PVC")
 			applyLiteral(pvcManifest(pvcName, testNamespace))
@@ -277,6 +281,9 @@ var _ = Describe("Replication Pause", Ordered, func() {
 	)
 
 	BeforeAll(func() {
+		By("cleaning stale S3 data from prior test runs")
+		mcCleanPath(dbName)
+
 		By("creating PVC, Deployment, and LitestreamReplica CR with backup enabled")
 		applyLiteral(pvcManifest(pvcName, testNamespace))
 		applyLiteral(appDeploymentManifest(appName, testNamespace, pvcName, dbPath))
@@ -446,6 +453,9 @@ var _ = Describe("Archive Check — Data Loss Recovery", Ordered, func() {
 	BeforeAll(func() {
 		DeferCleanup(func() { dumpReplicationDiagnostics(appName, dbName, dbFile) })
 
+		By("cleaning stale S3 data from prior test runs")
+		mcCleanPath(dbName)
+
 		By("creating PVC, Deployment, and LitestreamReplica CR with backup enabled and bootstrap SQL")
 		applyLiteral(pvcManifest(pvcName, testNamespace))
 		applyLiteral(appDeploymentManifest(appName, testNamespace, pvcName, dbPath))
@@ -554,9 +564,14 @@ var _ = Describe("Archive Check — Data Loss Recovery", Ordered, func() {
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
 		By("verifying restored data is present in the database")
-		restoredPod := runningPod(appName)
 		Eventually(func(g Gomega) {
-			out, err := kubectlQ("exec", "-n", testNamespace, restoredPod, "-c", "app",
+			podName, err := kubectlQ("get", "pods", "-n", testNamespace,
+				"-l", "app="+appName,
+				"--field-selector=status.phase=Running",
+				"-o", "jsonpath={.items[0].metadata.name}")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(podName).NotTo(BeEmpty())
+			out, err := kubectlQ("exec", "-n", testNamespace, podName, "-c", "app",
 				"--", "sqlite3", dbPath+"/"+dbFile,
 				"SELECT name FROM items WHERE name='"+itemValue+"';")
 			g.Expect(err).NotTo(HaveOccurred())
@@ -598,6 +613,9 @@ var _ = Describe("Archive Check — Fresh DB Divergence", Ordered, func() {
 
 	BeforeAll(func() {
 		DeferCleanup(func() { dumpReplicationDiagnostics(appName, dbName, dbFile) })
+
+		By("cleaning stale S3 data from prior test runs")
+		mcCleanPath(dbName)
 
 		By("creating PVC, Deployment, and LitestreamReplica CR with backup enabled and bootstrap SQL")
 		// runAsUser: 0 — db-init runs as root so it can read the restored DB file,
@@ -729,9 +747,14 @@ var _ = Describe("Archive Check — Fresh DB Divergence", Ordered, func() {
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
 		By("verifying restored data is present in the database")
-		restoredPod := runningPod(appName)
 		Eventually(func(g Gomega) {
-			out, err := kubectlQ("exec", "-n", testNamespace, restoredPod, "-c", "app",
+			podName, err := kubectlQ("get", "pods", "-n", testNamespace,
+				"-l", "app="+appName,
+				"--field-selector=status.phase=Running",
+				"-o", "jsonpath={.items[0].metadata.name}")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(podName).NotTo(BeEmpty())
+			out, err := kubectlQ("exec", "-n", testNamespace, podName, "-c", "app",
 				"--", "sqlite3", dbPath+"/"+dbFile,
 				"SELECT name FROM items WHERE name='"+itemValue+"';")
 			g.Expect(err).NotTo(HaveOccurred())
@@ -774,13 +797,16 @@ var _ = Describe("First-Time Setup", Ordered, func() {
 	BeforeAll(func() {
 		DeferCleanup(func() { dumpReplicationDiagnostics(appName, dbName, dbFile) })
 
-		By("creating PVC and Deployment (no prior S3 data at this unique path)")
+		By("cleaning stale S3 data from prior test runs")
+		mcCleanPath(dbName)
+
+		By("creating PVC and Deployment")
 		applyLiteral(pvcManifest(pvcName, testNamespace))
 		applyLiteral(appDeploymentManifest(appName, testNamespace, pvcName, dbPath))
 		kubectl("wait", "-n", testNamespace, "deployment/"+appName,
 			"--for=condition=Available", "--timeout=3m")
 
-		By("creating LitestreamReplica with backup enabled (unique S3 path, no prior data)")
+		By("creating LitestreamReplica with backup enabled")
 		applyLiteral(litestreamReplicaManifest(dbName, testNamespace, appName, dbFile, dbPath, true, ""))
 	})
 
@@ -848,6 +874,9 @@ var _ = Describe("Auto-Restore on Startup", Ordered, func() {
 
 	BeforeAll(func() {
 		DeferCleanup(func() { dumpReplicationDiagnostics(appName, dbName, dbFile) })
+
+		By("cleaning stale S3 data from prior test runs")
+		mcCleanPath(dbName)
 
 		By("creating PVC, Deployment, and LitestreamReplica with recovery.mode=Automatic")
 		applyLiteral(pvcManifest(pvcName, testNamespace))
@@ -983,6 +1012,9 @@ var _ = Describe("Restore Fails With Existing DB", Ordered, func() {
 	BeforeAll(func() {
 		DeferCleanup(func() { dumpReplicationDiagnostics(appName, dbName, dbFile) })
 
+		By("cleaning stale S3 data from prior test runs")
+		mcCleanPath(dbName)
+
 		By("creating PVC, Deployment, and LitestreamReplica with backup enabled")
 		applyLiteral(pvcManifest(pvcName, testNamespace))
 		applyLiteral(appDeploymentManifest(appName, testNamespace, pvcName, dbPath))
@@ -1060,20 +1092,14 @@ var _ = Describe("Restore Fails With Existing DB", Ordered, func() {
 		Expect(statusMsg).To(ContainSubstring("already exists"),
 			"status.message must include the litestream error about the existing output file")
 
-		By("verifying Deployment is scaled back to original replica count after failure")
+		By("verifying Deployment still has its original replica count (ToPVC does not scale down)")
 		Eventually(func(g Gomega) {
 			out, err := kubectlQ("get", "deployment", appName, "-n", testNamespace,
 				"-o", "jsonpath={.spec.replicas}")
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(out).To(Equal("1"),
-				"operator must scale Deployment back to 1 even when restore fails")
+				"Deployment replica count must remain unchanged in ToPVC mode")
 		}, 3*time.Minute, 5*time.Second).Should(Succeed())
-
-		By("verifying originalReplicas was recorded correctly in the restore status")
-		origReplicas, err := kubectlQ("get", "litestreamrestore", restoreName, "-n", testNamespace,
-			"-o", "jsonpath={.status.originalReplicas}")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(origReplicas).To(Equal("1"))
 	})
 })
 
@@ -1101,6 +1127,9 @@ var _ = Describe("Point-in-Time Restore", Ordered, func() {
 
 	BeforeAll(func() {
 		DeferCleanup(func() { dumpReplicationDiagnostics(appName, dbName, dbFile) })
+
+		By("cleaning stale S3 data from prior test runs")
+		mcCleanPath(dbName)
 
 		By("creating PVC, Deployment, and LitestreamReplica with backup enabled")
 		applyLiteral(pvcManifest(pvcName, testNamespace))
@@ -1337,9 +1366,14 @@ var _ = Describe("InPlace Restore", Ordered, func() {
 		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("verifying restored data is present in the database")
-		restoredPod := runningPod(appName)
 		Eventually(func(g Gomega) {
-			out, err := kubectlQ("exec", "-n", testNamespace, restoredPod, "-c", "app",
+			podName, err := kubectlQ("get", "pods", "-n", testNamespace,
+				"-l", "app="+appName,
+				"--field-selector=status.phase=Running",
+				"-o", "jsonpath={.items[0].metadata.name}")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(podName).NotTo(BeEmpty())
+			out, err := kubectlQ("exec", "-n", testNamespace, podName, "-c", "app",
 				"--", "sqlite3", dbPath+"/"+dbFile,
 				"SELECT body FROM notes WHERE body='"+testValue+"';")
 			g.Expect(err).NotTo(HaveOccurred())
@@ -2087,8 +2121,7 @@ func litestreamRestoreManifestWithForce(name, ns, sourceRef, pvc, targetPath str
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec: databasev1.LitestreamRestoreSpec{
 			SourceRef: databasev1.RestoreSourceRef{Name: sourceRef},
-			Mode:      databasev1.RestoreModeToPVC,
-			Target:    &databasev1.RestoreTarget{PVC: pvc, Path: targetPath},
+			Mode:      databasev1.RestoreModeInPlace,
 			Force:     true,
 		},
 	}

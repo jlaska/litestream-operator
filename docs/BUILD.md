@@ -46,7 +46,9 @@ helm install litestream-operator charts/litestream-operator \
 
 ### Integration tests
 
-Integration tests use Kind with an in-cluster MinIO (or external S3) backend:
+Integration tests use Kind with an in-cluster MinIO or an external S3-compatible
+backend. By default, MinIO is deployed inside the Kind cluster. Set `S3_ENDPOINT`,
+`S3_ACCESS_KEY`, and `S3_SECRET_KEY` to use an external backend (e.g. Garage).
 
 ```bash
 # Full integration test suite (creates a Kind cluster, deploys operator, runs tests)
@@ -54,6 +56,27 @@ make kind-test-integration
 
 # Rebuild and redeploy into existing cluster, then run tests
 make test-integration-redeploy
+
+# Use an external S3 backend (e.g. Garage)
+S3_ENDPOINT=https://garage.example.com \
+S3_ACCESS_KEY=... S3_SECRET_KEY=... \
+  make test-integration-redeploy
+```
+
+**Important:** When using an external S3 backend, data persists across test runs
+(unlike in-cluster MinIO, which is destroyed with the Kind cluster). Each test's
+`BeforeAll` calls `mcCleanPath(dbName)` to remove stale backup data from prior
+runs. Without this cleanup, the archive-check init container detects existing S3
+backup data alongside a missing local DB and blocks pod startup.
+
+**Running a single test:**
+
+```bash
+# Focus on a specific test by name
+KUBECONFIG=/tmp/litestream-integration-kubeconfig \
+S3_ENDPOINT=... S3_ACCESS_KEY=... S3_SECRET_KEY=... \
+  go test ./test/integration/... -v -timeout 20m -count=1 \
+  -ginkgo.focus="Archive Check"
 ```
 
 ## Container Image
