@@ -56,9 +56,10 @@ var _ = Describe("LitestreamRestore Controller", func() {
 
 	newRestoreReconciler := func() *LitestreamRestoreReconciler {
 		return &LitestreamRestoreReconciler{
-			Client:   k8sClient,
-			Scheme:   k8sClient.Scheme(),
-			Recorder: record.NewFakeRecorder(10),
+			Client:    k8sClient,
+			APIReader: k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Recorder:  record.NewFakeRecorder(10),
 		}
 	}
 
@@ -544,9 +545,10 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 
 	newReconciler := func() *LitestreamRestoreReconciler {
 		return &LitestreamRestoreReconciler{
-			Client:   k8sClient,
-			Scheme:   k8sClient.Scheme(),
-			Recorder: record.NewFakeRecorder(20),
+			Client:    k8sClient,
+			APIReader: k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Recorder:  record.NewFakeRecorder(20),
 		}
 	}
 
@@ -852,17 +854,18 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		reconciler := newReconciler()
 		driveToResuming(ctx, reconciler, dbKey, restoreKey, deployKey)
 
-		// Resuming reconcile sets skip-archive-check before the ConfigMap check.
-		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
-		Expect(err).NotTo(HaveOccurred())
+		// Resuming reconcile removes the pause annotation, then waits for the
+		// ConfigMap to reflect the unpaused config before setting skip-archive-check.
+		// Retry until the background LitestreamReplica controller updates the ConfigMap.
+		Eventually(func(g Gomega) {
+			_, reconcileErr := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
+			g.Expect(reconcileErr).NotTo(HaveOccurred())
 
-		// skip-archive-check must be set on the LitestreamReplica so that the
-		// restored DB (which has no litestream state directory yet) doesn't trigger
-		// a false-positive archive-check block on the next pod startup (issue #109).
-		db := &databasev1.LitestreamReplica{}
-		Expect(k8sClient.Get(ctx, dbKey, db)).To(Succeed())
-		Expect(db.Annotations[databasev1.AnnotationSkipArchiveCheck]).To(Equal("true"),
-			"restore controller must set skip-archive-check to prevent false-positive archive-check on next pod start")
+			db := &databasev1.LitestreamReplica{}
+			g.Expect(k8sClient.Get(ctx, dbKey, db)).To(Succeed())
+			g.Expect(db.Annotations[databasev1.AnnotationSkipArchiveCheck]).To(Equal("true"),
+				"restore controller must set skip-archive-check to prevent false-positive archive-check on next pod start")
+		}, 10*time.Second, 100*time.Millisecond).Should(Succeed())
 	})
 
 	It("leaves workload fenced on Job failure and removes pause annotation", func() {
@@ -1860,9 +1863,10 @@ var _ = Describe("LitestreamRestore State Machine with StatefulSet target", func
 
 	newReconciler := func() *LitestreamRestoreReconciler {
 		return &LitestreamRestoreReconciler{
-			Client:   k8sClient,
-			Scheme:   k8sClient.Scheme(),
-			Recorder: record.NewFakeRecorder(20),
+			Client:    k8sClient,
+			APIReader: k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Recorder:  record.NewFakeRecorder(20),
 		}
 	}
 
