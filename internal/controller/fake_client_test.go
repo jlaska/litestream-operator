@@ -393,6 +393,36 @@ var _ = Describe("LitestreamRestoreReconciler error injection", func() {
 		Expect(err.Error()).To(ContainSubstring("getting restore Job"))
 	})
 
+	It("reconcilePending fails restore when TargetStatefulSet does not exist", func() {
+		db := &databasev1.LitestreamReplica{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       srcDBName,
+				Namespace:  ns,
+				Finalizers: []string{replicaFinalizerName},
+			},
+			Spec: databasev1.LitestreamReplicaSpec{
+				DatabaseName:      "app.db",
+				DatabasePath:      "/data",
+				TargetStatefulSet: "nonexistent-sts",
+				Backup: databasev1.BackupSpec{
+					Enabled: true,
+					Destination: databasev1.BackupDestination{
+						S3: &databasev1.S3Destination{Bucket: "b", SecretRef: "s"},
+					},
+				},
+			},
+		}
+		restore := newFakeInPlaceRestore(restoreName, ns, srcDBName, databasev1.RestorePhasePending)
+		r := buildFakeRestoreClient([]client.Object{db, restore}, interceptor.Funcs{})
+		_, err := r.Reconcile(ctx, restoreKey)
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &databasev1.LitestreamRestore{}
+		Expect(r.Get(ctx, types.NamespacedName{Name: restoreName, Namespace: ns}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(databasev1.RestorePhaseFailed))
+		Expect(updated.Status.Message).To(ContainSubstring("cannot find workload"))
+	})
+
 	It("reconcileResuming returns error when resumeReplication re-fetch of LitestreamReplica fails", func() {
 		db := newFakeDB(srcDBName, ns, srcDepName)
 		// Pause annotation must be set so resumeReplication proceeds to the re-fetch.

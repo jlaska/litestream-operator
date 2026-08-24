@@ -620,6 +620,12 @@ var _ = Describe("SidecarInjector archive check", func() {
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: acDBName, Namespace: namespace}, db); err == nil {
 			_ = k8sClient.Delete(ctx, db)
 		}
+		restoreList := &databasev1.LitestreamRestoreList{}
+		if err := k8sClient.List(ctx, restoreList); err == nil {
+			for i := range restoreList.Items {
+				_ = k8sClient.Delete(ctx, &restoreList.Items[i])
+			}
+		}
 	})
 
 	It("injects archive-check init container when backup is enabled", func() {
@@ -808,6 +814,60 @@ var _ = Describe("SidecarInjector archive check", func() {
 			databasev1.AnnotationSkipArchiveCheck: "true",
 		}
 		Expect(k8sClient.Create(ctx, newBackupDB(annotations))).To(Succeed())
+
+		podAnnotations := map[string]string{
+			databasev1.AnnotationInject: injectTrue,
+			databasev1.AnnotationConfig: namespace + "/" + acDBName,
+		}
+		resp := newInjector().Handle(ctx, makeRequest(newPod(podAnnotations)))
+		Expect(resp.Allowed).To(BeTrue())
+
+		patched := applyAllPatches(newPod(podAnnotations), resp.Patches)
+		for _, c := range patched.Spec.InitContainers {
+			Expect(c.Name).NotTo(Equal("litestream-archive-check"))
+		}
+	})
+
+	It("skips archive-check via hasActiveRestore when a completed restore exists", func() {
+		db := newBackupDB(nil)
+		Expect(k8sClient.Create(ctx, db)).To(Succeed())
+
+		restore := &databasev1.LitestreamRestore{
+			ObjectMeta: metav1.ObjectMeta{Name: "ac-restore", Namespace: namespace},
+			Spec: databasev1.LitestreamRestoreSpec{
+				SourceRef: databasev1.RestoreSourceRef{Name: acDBName},
+			},
+		}
+		Expect(k8sClient.Create(ctx, restore)).To(Succeed())
+		restore.Status.Phase = databasev1.RestorePhaseCompleted
+		Expect(k8sClient.Status().Update(ctx, restore)).To(Succeed())
+
+		podAnnotations := map[string]string{
+			databasev1.AnnotationInject: injectTrue,
+			databasev1.AnnotationConfig: namespace + "/" + acDBName,
+		}
+		resp := newInjector().Handle(ctx, makeRequest(newPod(podAnnotations)))
+		Expect(resp.Allowed).To(BeTrue())
+
+		patched := applyAllPatches(newPod(podAnnotations), resp.Patches)
+		for _, c := range patched.Spec.InitContainers {
+			Expect(c.Name).NotTo(Equal("litestream-archive-check"))
+		}
+	})
+
+	It("skips archive-check via hasActiveRestore when a resuming restore exists", func() {
+		db := newBackupDB(nil)
+		Expect(k8sClient.Create(ctx, db)).To(Succeed())
+
+		restore := &databasev1.LitestreamRestore{
+			ObjectMeta: metav1.ObjectMeta{Name: "ac-restore-resuming", Namespace: namespace},
+			Spec: databasev1.LitestreamRestoreSpec{
+				SourceRef: databasev1.RestoreSourceRef{Name: acDBName},
+			},
+		}
+		Expect(k8sClient.Create(ctx, restore)).To(Succeed())
+		restore.Status.Phase = databasev1.RestorePhaseResuming
+		Expect(k8sClient.Status().Update(ctx, restore)).To(Succeed())
 
 		podAnnotations := map[string]string{
 			databasev1.AnnotationInject: injectTrue,
