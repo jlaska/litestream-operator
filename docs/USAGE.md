@@ -1,507 +1,327 @@
 # Litestream Operator Usage Guide
 
-This guide demonstrates how to use the Litestream Operator to create SQLite databases and connect applications to them.
+This guide covers day-to-day use of the Litestream Operator for SQLite backup and recovery in Kubernetes.
 
 ## Table of Contents
 
-- [Creating SQLite Databases](#creating-sqlite-databases)
-- [Connecting Applications](#connecting-applications)
-- [Storage Configuration](#storage-configuration)
-- [Database Initialization](#database-initialization)
-- [Examples](#examples)
+- [Recovery Modes](#recovery-modes)
+- [Disaster Recovery](#disaster-recovery)
+- [Point-in-Time Restore](#point-in-time-restore)
+- [Restore Without Downtime](#restore-without-downtime)
+- [Bootstrap SQL](#bootstrap-sql)
+- [Multi-Container Deployments](#multi-container-deployments)
+- [Operational Annotations](#operational-annotations)
 - [Troubleshooting](#troubleshooting)
 
-## Creating SQLite Databases
+## Recovery Modes
 
-### Basic SQLite Database
+The operator supports two recovery modes that control pod startup behavior when the local database is missing or inconsistent with the remote S3 archive.
 
-Create a simple SQLite database with default settings:
+### Manual (default)
+
+Manual mode blocks startup and requires an explicit `LitestreamRestore` to recover. This is the safest option for production.
+
+```yaml
+spec:
+  recovery:
+    mode: Manual
+```
+
+**Startup behavior:**
+
+| Local DB | Remote Archive | Result |
+|---|---|---|
+| Exists, trusted | Any | Allow startup |
+| Missing | Missing | Allow startup (genuinely new database) |
+| Missing | Exists | **Block startup** — archive available, explicit restore required |
+| Exists, untracked | Exists | **Block startup** — possible recreated-database-without-restore |
+
+When startup is blocked, the `RecoverySafe` condition becomes `False` with a message explaining why. Create a `LitestreamRestore` with `mode: InPlace` to recover.
+
+### Automatic
+
+Automatic mode uses upstream Litestream's native restore flags:
+
+```bash
+litestream restore \
+  -if-db-not-exists \
+  -if-replica-exists \
+  -integrity-check quick \
+  -config /etc/litestream/litestream.yml \
+  /path/database.sqlite
+```
+
+```yaml
+spec:
+  recovery:
+    mode: Automatic
+```
+
+Any genuine restore failure fails the init container and **prevents application startup**. The operator never converts a restore error into a fresh database.
+
+## Disaster Recovery
+
+### Scenario: PVC lost, remote archive intact
+
+**With Automatic recovery mode:**
+
+The pod's init container automatically restores from the S3 archive on next startup. No manual intervention required — the database is restored, integrity-checked, and the application starts.
+
+**With Manual recovery mode (default):**
+
+1. The pod starts but blocks — `RecoverySafe=False` because no local DB exists but the archive is available.
+
+2. Create an InPlace restore:
+   ```yaml
+   apiVersion: litestream.io/v1
+   kind: LitestreamRestore
+   metadata:
+     name: recover-db
+     namespace: my-app
+   spec:
+     sourceRef:
+       name: my-app-db
+     mode: InPlace
+   ```
+
+3. The restore controller:
+   - Acquires a concurrency lock (one active InPlace restore per source)
+   - Fences the application (scales workload to zero, pauses replication)
+   - Runs the restore Job
+   - Validates integrity
+   - Resumes the application
+
+4. Monitor progress:
+   ```bash
+   kubectl get litestreamrestore recover-db -n my-app -w
+   ```
+
+### Restore failure safety
+
+If a restore fails after fencing the application, the workload **remains at replicas=0**. This is intentional — starting against unverified data risks corruption.
+
+The `RestoreFailed` event and restore phase will indicate what went wrong. After investigating:
+- Fix the issue and create a new `LitestreamRestore`
+- Or manually verify the database and scale the workload back up
+
+## Point-in-Time Restore
+
+Restore the database to its state at a specific point in time using the `timestamp` field:
 
 ```yaml
 apiVersion: litestream.io/v1
-kind: LitestreamReplica
+kind: LitestreamRestore
 metadata:
-  name: my-app-db
-  namespace: default
+  name: pitr-restore
+  namespace: my-app
 spec:
-  databaseName: "appdata"
+  sourceRef:
+    name: my-app-db
+  mode: InPlace
+  timestamp: "2026-06-17T10:00:00Z"
 ```
 
-This creates:
-- PersistentVolumeClaim: `my-app-db-storage` (1Gi, default storage class)
-- Database file: `/data/appdata.db` (inside the SQLite pod)
-- Service: `my-app-db-service` for database access
+The timestamp must be in RFC 3339 format. Litestream replays WAL entries up to this point, giving you the exact database state at that instant.
 
-### SQLite Database with Custom Storage
+When omitted, the most recent snapshot is restored.
+
+## Restore Without Downtime
+
+Use `mode: ToPVC` to restore into a separate PVC without touching the source application. The source workload continues running normally throughout the restore.
 
 ```yaml
 apiVersion: litestream.io/v1
-kind: LitestreamReplica
+kind: LitestreamRestore
 metadata:
-  name: production-db
-  namespace: myapp
+  name: paperless-clone
+  namespace: paperless
 spec:
-  databaseName: "prod"
-  storage:
-    size: "10Gi"
-    storageClass: "longhorn"
-  initSQL: |
-    CREATE TABLE users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      email TEXT UNIQUE NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE INDEX idx_users_email ON users(email);
+  sourceRef:
+    name: paperless-db
+  mode: ToPVC
+  target:
+    pvc: paperless-restore-pvc
+    path: /data/paperless.db
+  timestamp: "2026-06-17T10:00:00Z"  # optional
 ```
 
-## Connecting Applications
+Use cases:
+- **Recovery testing**: Regularly verify that backups can be restored
+- **Forensic inspection**: Examine database state at a point in time
+- **Migration**: Clone a database for migration to another system
+- **Cloning**: Create a copy for development or testing
 
-Applications can connect to SQLite databases by mounting the same PersistentVolumeClaim created by the operator.
+The target PVC must already exist. The operator does not create PVCs.
 
-### Method 1: Shared Volume Access
+## Bootstrap SQL
 
-Mount the SQLite database storage directly in your application pod:
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: my-app
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: my-app
-  template:
-    metadata:
-      labels:
-        app: my-app
-    spec:
-      containers:
-      - name: app
-        image: my-app:latest
-        env:
-        - name: DATABASE_PATH
-          value: "/data/appdata.db"
-        volumeMounts:
-        - name: sqlite-storage
-          mountPath: /data
-        command: ["./my-app"]
-      volumes:
-      - name: sqlite-storage
-        persistentVolumeClaim:
-          claimName: my-app-db-storage  # Reference the LitestreamReplica's PVC
-```
-
-**Important Notes:**
-- Use `replicas: 1` to avoid SQLite locking issues (SQLite doesn't support concurrent writes)
-- The database file path is `/data/{databaseName}.db`
-- Mount the PVC with the same name pattern: `{litestreamreplica-name}-storage`
-
-### Method 2: Init Container Pattern
-
-Use an init container to ensure the database is ready before starting your application:
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: my-app-with-init
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: my-app
-  template:
-    metadata:
-      labels:
-        app: my-app
-    spec:
-      initContainers:
-      - name: wait-for-db
-        image: keinos/sqlite3:latest
-        command:
-        - sh
-        - -c
-        - |
-          until sqlite3 /data/appdata.db "SELECT 1;" > /dev/null 2>&1; do
-            echo "Waiting for database to be ready..."
-            sleep 2
-          done
-          echo "Database is ready!"
-        volumeMounts:
-        - name: sqlite-storage
-          mountPath: /data
-      containers:
-      - name: app
-        image: my-app:latest
-        env:
-        - name: DATABASE_PATH
-          value: "/data/appdata.db"
-        volumeMounts:
-        - name: sqlite-storage
-          mountPath: /data
-      volumes:
-      - name: sqlite-storage
-        persistentVolumeClaim:
-          claimName: my-app-db-storage
-```
-
-### Method 3: Sidecar Pattern
-
-Run your application with a SQLite management sidecar:
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: my-app-with-sidecar
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: my-app
-  template:
-    metadata:
-      labels:
-        app: my-app
-    spec:
-      containers:
-      - name: app
-        image: my-app:latest
-        env:
-        - name: DATABASE_PATH
-          value: "/data/appdata.db"
-        volumeMounts:
-        - name: sqlite-storage
-          mountPath: /data
-      - name: sqlite-manager
-        image: keinos/sqlite3:latest
-        command: ["sleep", "infinity"]
-        volumeMounts:
-        - name: sqlite-storage
-          mountPath: /data
-        # This sidecar can be used for database maintenance tasks
-      volumes:
-      - name: sqlite-storage
-        persistentVolumeClaim:
-          claimName: my-app-db-storage
-```
-
-## Storage Configuration
-
-### Storage Classes
-
-Specify custom storage classes for different performance requirements:
-
-```yaml
-# High-performance storage
-spec:
-  storage:
-    size: "5Gi"
-    storageClass: "ssd-high-iops"
-
-# Cost-effective storage
-spec:
-  storage:
-    size: "50Gi"
-    storageClass: "longhorn"
-
-# Default storage (omit storageClass)
-spec:
-  storage:
-    size: "2Gi"
-```
-
-### Storage Size Guidelines
-
-| Use Case | Recommended Size | Storage Class |
-|----------|------------------|---------------|
-| Development/Testing | 1-5Gi | default |
-| Small Applications | 5-20Gi | standard |
-| Medium Applications | 20-100Gi | ssd |
-| Large Applications | 100Gi+ | high-performance |
-
-## Database Initialization
-
-### Basic Table Creation
+Bootstrap SQL seeds the database schema when a genuinely new database is created — no local database file AND no remote archive.
 
 ```yaml
 spec:
-  databaseName: "blog"
-  initSQL: |
-    CREATE TABLE posts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      title TEXT NOT NULL,
-      content TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE INDEX idx_posts_created ON posts(created_at);
+  bootstrap:
+    sql: |
+      CREATE TABLE IF NOT EXISTS users (
+        id    INTEGER PRIMARY KEY AUTOINCREMENT,
+        name  TEXT NOT NULL,
+        email TEXT NOT NULL UNIQUE
+      );
+      CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 ```
 
-### Complex Initialization with Data
+Bootstrap SQL **does not run** when:
+- A local database already exists
+- A database was restored from an archive
+
+This prevents accidental re-initialization after disaster recovery. Applications should own schema migrations after bootstrap.
+
+## Multi-Container Deployments
+
+When the database volume is mounted in a non-first container, specify which container to use:
 
 ```yaml
 spec:
-  databaseName: "ecommerce"
-  initSQL: |
-    -- Create tables
-    CREATE TABLE categories (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT UNIQUE NOT NULL,
-      description TEXT
-    );
-
-    CREATE TABLE products (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      price DECIMAL(10,2),
-      category_id INTEGER,
-      stock INTEGER DEFAULT 0,
-      FOREIGN KEY (category_id) REFERENCES categories (id)
-    );
-
-    -- Insert initial data
-    INSERT INTO categories (name, description) VALUES
-      ('Electronics', 'Electronic devices and accessories'),
-      ('Books', 'Physical and digital books'),
-      ('Clothing', 'Apparel and accessories');
-
-    INSERT INTO products (name, price, category_id, stock) VALUES
-      ('Laptop', 999.99, 1, 10),
-      ('Python Programming', 49.99, 2, 50),
-      ('T-Shirt', 19.99, 3, 100);
+  targetDeployment: my-app
+  container: database-writer
+  databasePath: /var/lib/app/data
+  databaseName: app.db
 ```
 
-## Examples
+The operator resolves the volume mount from the specified container, including `subPath` configurations. The Litestream sidecar and init containers use the same volume mount semantics.
 
-### Example 1: Web Application with SQLite
+## Operational Annotations
 
-Complete example of a web application using SQLite:
+### Pause replication
 
-```yaml
-# 1. Create the SQLite database
-apiVersion: litestream.io/v1
-kind: LitestreamReplica
-metadata:
-  name: webapp-db
-  namespace: production
-spec:
-  databaseName: "webapp"
-  storage:
-    size: "5Gi"
-    storageClass: "ssd"
-  initSQL: |
-    CREATE TABLE users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT UNIQUE NOT NULL,
-      email TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
+Set `litestream.io/pause: "true"` on the LitestreamReplica CR to pause replication without killing the sidecar. The operator writes an empty database list to the Litestream ConfigMap.
 
-    CREATE TABLE sessions (
-      id TEXT PRIMARY KEY,
-      user_id INTEGER,
-      expires_at DATETIME,
-      FOREIGN KEY (user_id) REFERENCES users (id)
-    );
-
----
-# 2. Deploy the web application
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: webapp
-  namespace: production
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: webapp
-  template:
-    metadata:
-      labels:
-        app: webapp
-    spec:
-      containers:
-      - name: webapp
-        image: my-webapp:v1.0.0
-        ports:
-        - containerPort: 8080
-        env:
-        - name: DATABASE_PATH
-          value: "/data/webapp.db"
-        - name: PORT
-          value: "8080"
-        volumeMounts:
-        - name: database
-          mountPath: /data
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 8080
-          initialDelaySeconds: 30
-        readinessProbe:
-          httpGet:
-            path: /ready
-            port: 8080
-          initialDelaySeconds: 5
-      volumes:
-      - name: database
-        persistentVolumeClaim:
-          claimName: webapp-db-storage
-
----
-# 3. Expose the application
-apiVersion: v1
-kind: Service
-metadata:
-  name: webapp-service
-  namespace: production
-spec:
-  selector:
-    app: webapp
-  ports:
-  - port: 80
-    targetPort: 8080
-  type: ClusterIP
+```bash
+kubectl annotate litestreamreplica my-app-db litestream.io/pause=true -n my-app
 ```
 
-### Example 2: Microservice with Database Migration
-
-```yaml
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: db-migration
-spec:
-  template:
-    spec:
-      restartPolicy: OnFailure
-      containers:
-      - name: migrate
-        image: migrate/migrate:latest
-        command:
-        - migrate
-        - -path=/migrations
-        - -database=sqlite3:///data/appdata.db
-        - up
-        volumeMounts:
-        - name: migrations
-          mountPath: /migrations
-        - name: database
-          mountPath: /data
-      volumes:
-      - name: migrations
-        configMap:
-          name: db-migrations
-      - name: database
-        persistentVolumeClaim:
-          claimName: my-app-db-storage
+Remove to resume:
+```bash
+kubectl annotate litestreamreplica my-app-db litestream.io/pause- -n my-app
 ```
+
+### Skip archive check
+
+The archive-check init container is **automatically skipped** after an InPlace
+`LitestreamRestore` completes — the restore controller sets the annotation and
+the webhook also checks for a recently completed restore as a fallback. No
+manual intervention is needed for the normal restore flow.
+
+For manual bypass (e.g., intentionally starting fresh against an existing S3
+backup chain), set the annotation on the LitestreamReplica CR:
+
+```bash
+kubectl annotate litestreamreplica my-app-db litestream.io/skip-archive-check=true -n my-app
+```
+
+The annotation is automatically cleared once the Litestream sidecar is healthy.
 
 ## Troubleshooting
 
-### Common Issues
+### Pod stuck in Init (Manual recovery mode)
 
-#### 1. Database Locked Errors
+**Symptom**: Pod is stuck with init containers not completing.
 
-**Problem**: `database is locked` errors when multiple pods try to access SQLite.
+**Diagnosis**:
+```bash
+kubectl describe litestreamreplica my-app-db -n my-app
+# Look for RecoverySafe=False condition
+```
 
-**Solution**: SQLite doesn't support concurrent writes. Use `replicas: 1` in your deployment.
+**Cause**: Local database is missing but a remote archive exists. Manual mode requires explicit recovery.
 
+**Fix**: Create a `LitestreamRestore` with `mode: InPlace`.
+
+### UnsafeRolloutStrategy condition
+
+**Symptom**: `Ready=False`, `UnsafeRolloutStrategy=True`.
+
+**Cause**: The target Deployment uses `RollingUpdate` with `maxSurge > 0`. During a rollout, two pods could run simultaneously, creating concurrent SQLite writers and risking database corruption.
+
+**Fix**:
 ```yaml
-spec:
-  replicas: 1  # Important: Keep this as 1 for SQLite
+# Option 1: Recreate strategy
+strategy:
+  type: Recreate
+
+# Option 2: RollingUpdate with maxSurge=0
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 0
+    maxUnavailable: 1
 ```
 
-#### 2. Permission Denied
+### ReplicaCountExceeded condition
 
-**Problem**: Application can't read/write to database file.
+**Symptom**: `ReplicaCountExceeded=True`.
 
-**Solution**: Check file permissions and ensure the container runs with appropriate user:
+**Cause**: The target workload has `replicas > 1`. SQLite requires a single writer.
 
-```yaml
-spec:
-  securityContext:
-    runAsUser: 1000
-    runAsGroup: 1000
-    fsGroup: 1000
-```
+**Fix**: Set `replicas: 1` on the target Deployment/StatefulSet.
 
-#### 3. Database File Not Found
+### ReplicationHealthy=False
 
-**Problem**: Application can't find the database file.
+**Symptom**: `ReplicationHealthy=False` despite Litestream sidecar running.
 
-**Solution**: Verify the correct path and PVC name:
-
+**Diagnosis**:
 ```bash
-# Check if PVC exists
-kubectl get pvc
+# Check Litestream sidecar logs
+kubectl logs <pod-name> -c litestream -n my-app
 
-# Check the correct database path
-kubectl exec -it <sqlite-pod> -- ls -la /data/
-
-# Verify the database file name matches your spec
+# Check replication status
+kubectl get litestreamreplica my-app-db -n my-app -o jsonpath='{.status.replicationLag}'
 ```
 
-#### 4. Storage Class Not Found
+**Common causes**:
+- S3 credentials expired or invalid
+- Object store unreachable (network issue)
+- Replication lag exceeds `spec.health.maxReplicationLag`
 
-**Problem**: PVC stuck in `Pending` state due to missing storage class.
+### Restore stuck in AcquiringLock
 
-**Solution**: Check available storage classes:
+**Cause**: Another InPlace restore is active for the same source. Only one InPlace restore can run per LitestreamReplica at a time.
 
+**Diagnosis**:
 ```bash
-kubectl get storageclass
-
-# Use a valid storage class or omit for default
+kubectl get litestreamrestore -n my-app
+# Look for another restore in Fencing/Restoring/Resuming phase
 ```
 
-### Debugging Commands
+**Fix**: Wait for the active restore to complete, or delete it if stuck.
 
+### Bad S3 credentials
+
+**Symptom**: Litestream sidecar logs show authentication errors. `ReplicationHealthy=False`.
+
+**Fix**: Update the Secret referenced by `spec.backup.destination.s3.secretRef`:
 ```bash
-# Check LitestreamReplica status
-kubectl get litestreamreplica
-kubectl describe litestreamreplica my-app-db
-
-# Check PVC status
-kubectl get pvc
-kubectl describe pvc my-app-db-storage
-
-# Check database contents
-kubectl exec -it <sqlite-pod> -- sqlite3 /data/appdata.db ".tables"
-kubectl exec -it <sqlite-pod> -- sqlite3 /data/appdata.db ".schema"
-
-# Check file permissions
-kubectl exec -it <sqlite-pod> -- ls -la /data/
+kubectl create secret generic minio-creds \
+  --from-literal=ACCESS_KEY_ID=<new-key> \
+  --from-literal=SECRET_ACCESS_KEY=<new-secret> \
+  --namespace my-app \
+  --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-### Performance Considerations
+Then trigger a pod restart to pick up the new credentials.
 
-1. **Single Writer**: SQLite only supports one concurrent writer
-2. **Read Replicas**: Consider read-only replicas for read-heavy workloads
-3. **Storage Performance**: Use SSD storage classes for better I/O performance
-4. **Database Size**: Monitor database size and plan storage accordingly
-5. **Backup Strategy**: Implement regular backups for production databases
+### PVC/mount mismatch
 
-### Best Practices
+**Symptom**: Litestream sidecar can't find the database file.
 
-1. **Use appropriate storage classes** for your performance requirements
-2. **Set resource limits** on your application pods
-3. **Implement health checks** to ensure database connectivity
-4. **Use init containers** to wait for database readiness
-5. **Monitor database size** and performance metrics
-6. **Plan for database migrations** in your application lifecycle
-7. **Implement proper error handling** for database operations
-8. **Use connection pooling** where appropriate (though less critical for SQLite)
+**Cause**: `spec.databasePath` doesn't match the actual mount path in the application container, or `subPath` is used but not accounted for.
 
-## Additional Resources
+**Diagnosis**:
+```bash
+# Check what's actually mounted
+kubectl exec <pod-name> -c <app-container> -n my-app -- ls -la /data/
 
-- [SQLite Documentation](https://sqlite.org/docs.html)
-- [Kubernetes Persistent Volumes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/)
-- [Storage Classes](https://kubernetes.io/docs/concepts/storage/storage-classes/)
-- [Pod Security Standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/)
+# Check the Litestream config
+kubectl get configmap <cr-name>-litestream -n my-app -o yaml
+```
+
+**Fix**: Ensure `spec.databasePath` matches the directory where the database file lives inside the application container. If the container uses `subPath`, the operator resolves it automatically — just specify the container-visible path.

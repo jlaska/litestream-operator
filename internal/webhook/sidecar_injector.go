@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	databasev1 "github.com/jlaska/litestream-operator/api/v1"
@@ -50,11 +51,11 @@ const injectTrue = "true"
 // archiveCheckContainerName is the name of the archive-check init container.
 const archiveCheckContainerName = "litestream-archive-check"
 
-// dbInitContainerName is the name given to the injected init container.
-const dbInitContainerName = "db-init"
+// dbBootstrapContainerName is the name given to the injected bootstrap init container.
+const dbBootstrapContainerName = "db-bootstrap"
 
-// dbInitSQLVolume is the name of the volume that mounts init.sql.
-const dbInitSQLVolume = "db-init-sql"
+// dbBootstrapSQLVolume is the name of the volume that mounts bootstrap.sql.
+const dbBootstrapSQLVolume = "db-bootstrap-sql"
 
 // SidecarInjector is a mutating admission webhook that injects a Litestream
 // replication sidecar into pods belonging to annotated Deployments.
@@ -96,6 +97,18 @@ func (s *SidecarInjector) Handle(ctx context.Context, req admission.Request) adm
 	}
 	if db == nil {
 		return admission.Allowed("no LitestreamReplica config reference found")
+	}
+
+	// Check if a recently completed restore should suppress archive-check.
+	// This is a fallback for the skip-archive-check annotation, which can be
+	// lost due to races between the restore and replica controllers.
+	if db.Annotations[databasev1.AnnotationSkipArchiveCheck] != injectTrue {
+		if s.hasActiveRestore(ctx, db) {
+			if db.Annotations == nil {
+				db.Annotations = make(map[string]string)
+			}
+			db.Annotations[databasev1.AnnotationSkipArchiveCheck] = injectTrue
+		}
 	}
 
 	// Inject the sidecar and return the patch.
@@ -152,9 +165,9 @@ const defaultEphemeralStorageLimit = "1Gi"
 
 // inject mutates the pod spec in-place to add the Litestream sidecar.
 func (s *SidecarInjector) inject(pod *corev1.Pod, db *databasev1.LitestreamReplica) error {
-	// The sidecar shares the volume that already mounts the database path.
-	// We look for a volume mount in the first container that covers databasePath.
-	volumeName, err := s.findVolumeForPath(pod, db.Spec.DatabasePath)
+	// Resolve the volume mount covering the database path, using explicit
+	// container selection when spec.container is set.
+	mount, err := s.findVolumeForPath(pod, db.Spec.DatabasePath, db.Spec.Container)
 	if err != nil {
 		return err
 	}
@@ -162,6 +175,14 @@ func (s *SidecarInjector) inject(pod *corev1.Pod, db *databasev1.LitestreamRepli
 	image := db.Spec.Image
 	if image == "" {
 		image = litestreamDefaultImage
+	}
+
+	sidecarDataMount := corev1.VolumeMount{
+		Name:      mount.volumeName,
+		MountPath: mount.mountPath,
+	}
+	if mount.subPath != "" {
+		sidecarDataMount.SubPath = mount.subPath
 	}
 
 	sidecar := corev1.Container{
@@ -172,10 +193,7 @@ func (s *SidecarInjector) inject(pod *corev1.Pod, db *databasev1.LitestreamRepli
 			{Name: "metrics", ContainerPort: 9090, Protocol: corev1.ProtocolTCP},
 		},
 		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      volumeName,
-				MountPath: db.Spec.DatabasePath,
-			},
+			sidecarDataMount,
 			{
 				Name:      litestreamConfigVolume,
 				MountPath: litestreamConfigMount,
@@ -211,29 +229,36 @@ func (s *SidecarInjector) inject(pod *corev1.Pod, db *databasev1.LitestreamRepli
 	})
 
 	// Add Prometheus scrape annotations to the pod so standard service monitors
-	// can discover the sidecar's /metrics endpoint.
+	// can discover the sidecar's /metrics endpoint. Preserve existing values so
+	// application-level metrics annotations are not silently overwritten.
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
 	}
-	pod.Annotations["prometheus.io/scrape"] = "true"
-	pod.Annotations["prometheus.io/port"] = "9090"
-	pod.Annotations["prometheus.io/path"] = "/metrics"
+	if pod.Annotations["prometheus.io/scrape"] == "" {
+		pod.Annotations["prometheus.io/scrape"] = "true"
+	}
+	if pod.Annotations["prometheus.io/port"] == "" {
+		pod.Annotations["prometheus.io/port"] = "9090"
+	}
+	if pod.Annotations["prometheus.io/path"] == "" {
+		pod.Annotations["prometheus.io/path"] = "/metrics"
+	}
 
 	// Inject the startup init container:
-	//   autoRestore=true  → upstream-style restore with mandatory integrity gate
-	//   autoRestore=false → archive-check that blocks if S3 has data but DB missing
+	//   recovery.mode=Automatic → upstream-style restore with mandatory integrity gate
+	//   recovery.mode=Manual    → archive-check that blocks if S3 has data but DB missing
 	if db.Spec.Backup.Enabled {
 		skipArchive := db.Annotations[databasev1.AnnotationSkipArchiveCheck] == "true"
-		if db.Spec.Backup.AutoRestore {
-			s.injectAutoRestoreContainer(pod, db, volumeName)
+		if db.Spec.Recovery.Mode == databasev1.RecoveryModeAutomatic {
+			s.injectAutoRestoreContainer(pod, db, mount)
 		} else if !skipArchive {
-			s.injectArchiveCheckContainer(pod, db, volumeName)
+			s.injectArchiveCheckContainer(pod, db, mount)
 		}
 	}
 
-	// Inject the SQL init container when InitSQL is configured.
-	if db.Spec.InitSQL != "" {
-		s.injectInitContainer(pod, db, volumeName)
+	// Inject the bootstrap SQL init container when Bootstrap.SQL is configured.
+	if db.Spec.Bootstrap.SQL != "" {
+		s.injectBootstrapContainer(pod, db, mount)
 	}
 
 	return nil
@@ -259,14 +284,21 @@ const autoRestoreContainerName = "litestream-restore"
 // buildLitestreamInitContainer builds the shared container structure for both
 // the archive-check and auto-restore init containers. Both containers use the
 // same image, env vars, and volume mounts; only the name and script differ.
-func buildLitestreamInitContainer(name, script, image, dbPath, dataVolumeName string, envVars []corev1.EnvVar, runAsUser, runAsGroup *int64) corev1.Container {
+func buildLitestreamInitContainer(name, script, image string, mount resolvedMount, envVars []corev1.EnvVar, runAsUser, runAsGroup *int64) corev1.Container {
+	dataMount := corev1.VolumeMount{
+		Name:      mount.volumeName,
+		MountPath: mount.mountPath,
+	}
+	if mount.subPath != "" {
+		dataMount.SubPath = mount.subPath
+	}
 	c := corev1.Container{
 		Name:    name,
 		Image:   image,
 		Command: []string{"sh", "-c", script},
 		Env:     envVars,
 		VolumeMounts: []corev1.VolumeMount{
-			{Name: dataVolumeName, MountPath: dbPath},
+			dataMount,
 			{Name: litestreamConfigVolume, MountPath: litestreamConfigMount, ReadOnly: true},
 		},
 	}
@@ -294,7 +326,7 @@ func buildLitestreamInitContainer(name, script, image, dbPath, dataVolumeName st
 //
 // This mirrors CNPG's "empty WAL archive check" pattern. The check runs before the app
 // starts, so there is no race with app DB initialization.
-func (s *SidecarInjector) injectArchiveCheckContainer(pod *corev1.Pod, db *databasev1.LitestreamReplica, dataVolumeName string) {
+func (s *SidecarInjector) injectArchiveCheckContainer(pod *corev1.Pod, db *databasev1.LitestreamReplica, mount resolvedMount) {
 	image := db.Spec.Image
 	if image == "" {
 		image = litestreamDefaultImage
@@ -377,18 +409,19 @@ exit 0
 		envVars = s3CredsEnvVars(db.Spec.Backup.Destination.S3.SecretRef)
 	}
 
-	c := buildLitestreamInitContainer(archiveCheckContainerName, script, image, db.Spec.DatabasePath, dataVolumeName, envVars, db.Spec.RunAsUser, db.Spec.RunAsGroup)
+	c := buildLitestreamInitContainer(archiveCheckContainerName, script, image, mount, envVars, db.Spec.RunAsUser, db.Spec.RunAsGroup)
 	pod.Spec.InitContainers = append([]corev1.Container{c}, pod.Spec.InitContainers...)
 }
 
-// injectAutoRestoreContainer adds an init container that implements the upstream
-// Kubernetes guide's recommended auto-restore pattern:
-//  1. litestream restore -if-db-not-exists -if-replica-exists (restore if missing + backup exists)
-//  2. PRAGMA quick_check integrity gate (blocks pod startup on corrupt restore)
+// injectAutoRestoreContainer adds an init container that uses native Litestream
+// restore with built-in integrity checking:
 //
-// This replaces the archive-check container when spec.backup.autoRestore=true.
-// The integrity gate mitigates known Litestream restore corruption issues (#1164, #1220).
-func (s *SidecarInjector) injectAutoRestoreContainer(pod *corev1.Pod, db *databasev1.LitestreamReplica, dataVolumeName string) {
+//	litestream restore -if-db-not-exists -if-replica-exists -integrity-check quick
+//
+// This replaces the archive-check container when recovery.mode=Automatic.
+// Any genuine restore failure (bad credentials, network, corruption) exits non-zero
+// and blocks pod startup — the operator never silently starts fresh.
+func (s *SidecarInjector) injectAutoRestoreContainer(pod *corev1.Pod, db *databasev1.LitestreamReplica, mount resolvedMount) {
 	image := db.Spec.Image
 	if image == "" {
 		image = litestreamDefaultImage
@@ -396,10 +429,6 @@ func (s *SidecarInjector) injectAutoRestoreContainer(pod *corev1.Pod, db *databa
 
 	dbFullPath := db.Spec.DatabasePath + "/" + db.Spec.DatabaseName
 
-	// The script:
-	//   1. Restore with upstream flags — skips if DB exists or no backup available.
-	//   2. If restore ran (DB now present), validate integrity with sqlite3.
-	//   3. On integrity failure, block pod startup with an actionable error.
 	script := fmt.Sprintf(`
 DB_PATH="%s"
 if [ -f "${DB_PATH}" ]; then
@@ -407,30 +436,23 @@ if [ -f "${DB_PATH}" ]; then
   exit 0
 fi
 echo "litestream-restore: database missing, attempting restore from backup..."
-litestream restore -if-db-not-exists -if-replica-exists -config /etc/litestream/litestream.yml "${DB_PATH}"
+litestream restore \
+  -if-db-not-exists \
+  -if-replica-exists \
+  -integrity-check quick \
+  -config /etc/litestream/litestream.yml \
+  "${DB_PATH}"
 RESTORE_EXIT=$?
 if [ $RESTORE_EXIT -ne 0 ]; then
-  echo "litestream-restore: restore failed or no backup found, starting fresh"
-  exit 0
-fi
-if [ ! -f "${DB_PATH}" ]; then
-  echo "litestream-restore: no backup found, starting fresh"
-  exit 0
-fi
-echo "litestream-restore: restore complete, running integrity check..."
-if ! command -v sqlite3 > /dev/null 2>&1; then
-  echo "WARNING: sqlite3 not found in image; skipping integrity check"
-  exit 0
-fi
-if ! sqlite3 "${DB_PATH}" "PRAGMA quick_check;" | grep -q "^ok$"; then
-  echo "ERROR: integrity check failed on restored database."
-  echo "The S3 backup may contain corruption (Litestream upstream issue #1164/#1220)."
+  echo "litestream-restore: FAILED — litestream restore exited with code ${RESTORE_EXIT}"
+  echo "litestream-restore: the application will NOT start against unverified data."
   echo "Options:"
-  echo "  1. Use a LitestreamRestore CR with a different -timestamp to find a clean snapshot."
-  echo "  2. Set annotation litestream.io/skip-archive-check=true to start fresh."
+  echo "  1. Check S3 credentials and connectivity."
+  echo "  2. Use a LitestreamRestore CR with a different -timestamp."
+  echo "  3. Set annotation litestream.io/skip-archive-check=true to start fresh."
   exit 1
 fi
-echo "litestream-restore: integrity check passed"
+echo "litestream-restore: restore and integrity check passed"
 exit 0
 `, dbFullPath)
 
@@ -439,7 +461,7 @@ exit 0
 		envVars = s3CredsEnvVars(db.Spec.Backup.Destination.S3.SecretRef)
 	}
 
-	c := buildLitestreamInitContainer(autoRestoreContainerName, script, image, db.Spec.DatabasePath, dataVolumeName, envVars, db.Spec.RunAsUser, db.Spec.RunAsGroup)
+	c := buildLitestreamInitContainer(autoRestoreContainerName, script, image, mount, envVars, db.Spec.RunAsUser, db.Spec.RunAsGroup)
 	pod.Spec.InitContainers = append([]corev1.Container{c}, pod.Spec.InitContainers...)
 }
 
@@ -467,90 +489,145 @@ func s3CredsEnvVars(secretRef string) []corev1.EnvVar {
 	}
 }
 
-// injectInitContainer adds an init container that applies InitSQL to the
-// database exactly once, guarded by a SHA-256 hash marker file on the PVC.
-// The marker file lives at {databasePath}/.db-init-{hash} so it persists
-// across pod restarts; a change in InitSQL produces a new hash and a new
-// marker, triggering re-application on the next rollout.
-func (s *SidecarInjector) injectInitContainer(pod *corev1.Pod, db *databasev1.LitestreamReplica, dataVolumeName string) {
-	initImage := db.Spec.InitImage
-	if initImage == "" {
-		initImage = "keinos/sqlite3:latest"
+// injectBootstrapContainer adds an init container that applies bootstrap SQL
+// only when the database is genuinely new (no DB file exists after the
+// archive-check/auto-restore init container has run).
+func (s *SidecarInjector) injectBootstrapContainer(pod *corev1.Pod, db *databasev1.LitestreamReplica, mount resolvedMount) {
+	bootstrapImage := db.Spec.Bootstrap.Image
+	if bootstrapImage == "" {
+		bootstrapImage = "keinos/sqlite3:latest"
 	}
 
 	dbFullPath := db.Spec.DatabasePath + "/" + db.Spec.DatabaseName
 
-	// The shell script runs inside the init container:
-	//   1. Compute the SHA-256 hash of init.sql.
-	//   2. If the hash marker file does not exist, apply the SQL and create it.
-	//   3. Exit 0 in both cases so pod startup is never blocked by a prior run.
 	script := fmt.Sprintf(`
-HASH=$(sha256sum /init/init.sql | cut -d' ' -f1)
-MARKER="%s/.db-init-${HASH}"
-if [ ! -f "${MARKER}" ]; then
-  sqlite3 "%s" < /init/init.sql
-  touch "${MARKER}"
-  echo "db-init: applied init SQL (hash ${HASH})"
-else
-  echo "db-init: already applied (hash ${HASH}), skipping"
+DB_PATH="%s"
+if [ -f "${DB_PATH}" ]; then
+  echo "db-bootstrap: database already exists, skipping bootstrap"
+  exit 0
 fi
-`, db.Spec.DatabasePath, dbFullPath)
+echo "db-bootstrap: database is genuinely new, applying bootstrap SQL"
+sqlite3 "${DB_PATH}" < /bootstrap/bootstrap.sql
+chmod 666 "${DB_PATH}"
+echo "db-bootstrap: bootstrap SQL applied"
+`, dbFullPath)
 
-	initContainer := corev1.Container{
-		Name:    dbInitContainerName,
-		Image:   initImage,
+	dataMount := corev1.VolumeMount{
+		Name:      mount.volumeName,
+		MountPath: mount.mountPath,
+	}
+	if mount.subPath != "" {
+		dataMount.SubPath = mount.subPath
+	}
+	bootstrapContainer := corev1.Container{
+		Name:    dbBootstrapContainerName,
+		Image:   bootstrapImage,
 		Command: []string{"sh", "-c", script},
 		VolumeMounts: []corev1.VolumeMount{
+			dataMount,
 			{
-				Name:      dataVolumeName,
-				MountPath: db.Spec.DatabasePath,
-			},
-			{
-				Name:      dbInitSQLVolume,
-				MountPath: "/init",
+				Name:      dbBootstrapSQLVolume,
+				MountPath: "/bootstrap",
 				ReadOnly:  true,
 			},
 		},
 	}
 	if db.Spec.RunAsUser != nil || db.Spec.RunAsGroup != nil {
-		initContainer.SecurityContext = &corev1.SecurityContext{
+		bootstrapContainer.SecurityContext = &corev1.SecurityContext{
 			RunAsUser:  db.Spec.RunAsUser,
 			RunAsGroup: db.Spec.RunAsGroup,
 		}
 	}
 
-	pod.Spec.InitContainers = append(pod.Spec.InitContainers, initContainer)
+	pod.Spec.InitContainers = append(pod.Spec.InitContainers, bootstrapContainer)
 
 	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
-		Name: dbInitSQLVolume,
+		Name: dbBootstrapSQLVolume,
 		VolumeSource: corev1.VolumeSource{
 			ConfigMap: &corev1.ConfigMapVolumeSource{
 				LocalObjectReference: corev1.LocalObjectReference{
-					Name: db.Name + "-init-sql",
+					Name: db.Name + "-bootstrap-sql",
 				},
 			},
 		},
 	})
 }
 
-// findVolumeForPath returns the name of a volume whose mount path in the first
-// application container covers the given database path. Returns an error if
-// none is found — the operator requires the app to mount its data volume
-// explicitly so that Litestream can share it.
-func (s *SidecarInjector) findVolumeForPath(pod *corev1.Pod, dbPath string) (string, error) {
+// resolvedMount holds the resolved volume mount information for the database path.
+type resolvedMount struct {
+	volumeName string
+	mountPath  string
+	subPath    string
+}
+
+// findVolumeForPath resolves the volume mount covering the database path.
+// When containerName is set, it searches that specific container; otherwise
+// it uses the first container. Returns the best (longest-prefix) match.
+func (s *SidecarInjector) findVolumeForPath(pod *corev1.Pod, dbPath, containerName string) (resolvedMount, error) {
 	if len(pod.Spec.Containers) == 0 {
-		return "", fmt.Errorf("pod has no containers")
+		return resolvedMount{}, fmt.Errorf("pod has no containers")
 	}
 
-	for _, vm := range pod.Spec.Containers[0].VolumeMounts {
+	var targetContainer *corev1.Container
+	if containerName != "" {
+		for i := range pod.Spec.Containers {
+			if pod.Spec.Containers[i].Name == containerName {
+				targetContainer = &pod.Spec.Containers[i]
+				break
+			}
+		}
+		if targetContainer == nil {
+			return resolvedMount{}, fmt.Errorf("container %q not found in pod spec", containerName)
+		}
+	} else {
+		targetContainer = &pod.Spec.Containers[0]
+	}
+
+	var bestMatch *corev1.VolumeMount
+	var bestLen int
+	for i := range targetContainer.VolumeMounts {
+		vm := &targetContainer.VolumeMounts[i]
 		if vm.MountPath == dbPath || strings.HasPrefix(dbPath, vm.MountPath+"/") {
-			return vm.Name, nil
+			if len(vm.MountPath) > bestLen {
+				bestMatch = vm
+				bestLen = len(vm.MountPath)
+			}
 		}
 	}
+	if bestMatch == nil {
+		return resolvedMount{}, fmt.Errorf(
+			"no volume mount in container %q covers database path %q; "+
+				"ensure the application mounts a volume at %q",
+			targetContainer.Name, dbPath, dbPath,
+		)
+	}
 
-	return "", fmt.Errorf(
-		"no volume mount in container %q covers database path %q; "+
-			"ensure the application mounts a volume at %q",
-		pod.Spec.Containers[0].Name, dbPath, dbPath,
-	)
+	return resolvedMount{
+		volumeName: bestMatch.Name,
+		mountPath:  bestMatch.MountPath,
+		subPath:    bestMatch.SubPath,
+	}, nil
+}
+
+// hasActiveRestore checks if there is a LitestreamRestore in Resuming or
+// Completed phase that references this LitestreamReplica. A recently completed
+// restore means the archive-check should be skipped because the data was just
+// restored. This is a fallback for the skip-archive-check annotation which can
+// be lost due to concurrent controller writes.
+func (s *SidecarInjector) hasActiveRestore(ctx context.Context, db *databasev1.LitestreamReplica) bool {
+	restoreList := &databasev1.LitestreamRestoreList{}
+	if err := s.Client.List(ctx, restoreList, client.InNamespace(db.Namespace)); err != nil {
+		logf.FromContext(ctx).V(1).Info("Failed to list LitestreamRestores for skip-archive-check fallback", "error", err)
+		return false
+	}
+	for _, restore := range restoreList.Items {
+		if restore.Spec.SourceRef.Name != db.Name {
+			continue
+		}
+		if restore.Status.Phase == databasev1.RestorePhaseResuming ||
+			restore.Status.Phase == databasev1.RestorePhaseCompleted {
+			return true
+		}
+	}
+	return false
 }

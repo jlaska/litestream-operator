@@ -233,6 +233,7 @@ func main() {
 		Scheme:     mgr.GetScheme(),
 		Recorder:   mgr.GetEventRecorderFor("litestreamrestore-controller"), //nolint:staticcheck
 		KubeClient: kubeClient,
+		APIReader:  mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "LitestreamRestore")
 		os.Exit(1)
@@ -241,6 +242,11 @@ func main() {
 	if webhooksEnabled {
 		if err := (&litestreamwebhook.LitestreamReplicaValidator{}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "LitestreamReplica")
+			os.Exit(1)
+		}
+
+		if err := (&litestreamwebhook.LitestreamRestoreValidator{}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "LitestreamRestore")
 			os.Exit(1)
 		}
 

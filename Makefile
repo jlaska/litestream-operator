@@ -102,6 +102,12 @@ cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 #   INTEGRATION_SKIP_CLUSTER_CREATE=true  skip 'kind create' (use existing cluster)
 #   INTEGRATION_KEEP_NAMESPACE=true       leave test namespace after run (for debugging)
 #
+# External S3 backend (optional — skips in-cluster MinIO when set):
+#   S3_ENDPOINT    S3-compatible endpoint (e.g. https://garage.internal.keener.us)
+#   S3_ACCESS_KEY  access key ID
+#   S3_SECRET_KEY  secret access key
+#   S3_BUCKET      bucket name (default: litestream-backups)
+#
 # Podman support:
 #   When CONTAINER_TOOL=podman (or podman is the only available runtime),
 #   the setup target sets KIND_EXPERIMENTAL_PROVIDER=podman automatically.
@@ -152,12 +158,18 @@ test-integration-setup: docker-build ## Create Kind cluster (with Podman support
 	@for img in \
 	  litestream/litestream:0.5.14 \
 	  keinos/sqlite3:latest \
-	  quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z \
 	  quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z; do \
 	    echo "    pulling $$img"; \
 	    $(CONTAINER_TOOL) pull $$img; \
 	    $(_KIND_PROVIDER_ENV) $(KIND) load docker-image $$img --name $(INTEGRATION_KIND_CLUSTER); \
 	done
+	@if [ -z "$(S3_ENDPOINT)" ]; then \
+	    echo "    pulling quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z"; \
+	    $(CONTAINER_TOOL) pull quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z; \
+	    $(_KIND_PROVIDER_ENV) $(KIND) load docker-image quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z --name $(INTEGRATION_KIND_CLUSTER); \
+	else \
+	    echo "    (skipping MinIO server image — using external S3)"; \
+	fi
 
 	@echo "==> Installing cert-manager $(CERT_MANAGER_VERSION)"
 	KUBECONFIG=$(INTEGRATION_KUBECONFIG) kubectl apply -f \
@@ -179,6 +191,10 @@ test-integration-setup: docker-build ## Create Kind cluster (with Podman support
 .PHONY: test-integration
 test-integration: ## Run integration tests (requires setup to be done first)
 	KUBECONFIG=$(INTEGRATION_KUBECONFIG) \
+	S3_ENDPOINT=$(S3_ENDPOINT) \
+	S3_ACCESS_KEY=$(S3_ACCESS_KEY) \
+	S3_SECRET_KEY=$(S3_SECRET_KEY) \
+	S3_BUCKET=$(S3_BUCKET) \
 		go test ./test/integration/... -v -timeout 20m
 
 .PHONY: test-integration-redeploy
@@ -190,12 +206,16 @@ test-integration-redeploy: docker-build ## Rebuild image, reload into existing c
 	@for img in \
 	  litestream/litestream:0.5.14 \
 	  keinos/sqlite3:latest \
-	  quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z \
 	  quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z; do \
 	    echo "    $$img"; \
 	    $(CONTAINER_TOOL) pull $$img 2>/dev/null || true; \
 	    $(_KIND_PROVIDER_ENV) $(KIND) load docker-image $$img --name $(INTEGRATION_KIND_CLUSTER); \
 	done
+	@if [ -z "$(S3_ENDPOINT)" ]; then \
+	    echo "    quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z"; \
+	    $(CONTAINER_TOOL) pull quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z 2>/dev/null || true; \
+	    $(_KIND_PROVIDER_ENV) $(KIND) load docker-image quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z --name $(INTEGRATION_KIND_CLUSTER); \
+	fi
 	@echo "==> Restarting operator"
 	KUBECONFIG=$(INTEGRATION_KUBECONFIG) kubectl rollout restart \
 		deployment/litestream-operator -n $(OPERATOR_NAMESPACE)

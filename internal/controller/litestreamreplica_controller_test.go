@@ -23,6 +23,7 @@ import (
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -52,6 +53,7 @@ var _ = Describe("LitestreamReplica Controller", func() {
 		dep := &appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{Name: deploymentName, Namespace: namespaceName},
 			Spec: appsv1.DeploymentSpec{
+				Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
 				Selector: &metav1.LabelSelector{
 					MatchLabels: map[string]string{appLabel: deploymentName},
 				},
@@ -79,7 +81,7 @@ var _ = Describe("LitestreamReplica Controller", func() {
 
 	AfterEach(func() {
 		// Delete ConfigMaps explicitly — envtest does not GC owned objects.
-		for _, name := range []string{resourceName + "-litestream", resourceName + "-init-sql"} {
+		for _, name := range []string{resourceName + "-litestream", resourceName + "-bootstrap-sql"} {
 			cm := &corev1.ConfigMap{}
 			if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespaceName}, cm); err == nil {
 				_ = k8sClient.Delete(ctx, cm)
@@ -88,6 +90,10 @@ var _ = Describe("LitestreamReplica Controller", func() {
 		db := &databasev1.LitestreamReplica{}
 		if err := k8sClient.Get(ctx, namespacedName, db); err == nil {
 			Expect(k8sClient.Delete(ctx, db)).To(Succeed())
+			// Wait for the finalizer to complete and the CR to be fully removed.
+			Eventually(func() bool {
+				return errors.IsNotFound(k8sClient.Get(ctx, namespacedName, db))
+			}).Should(BeTrue())
 		}
 		dep := &appsv1.Deployment{}
 		if err := k8sClient.Get(ctx, deploymentKey, dep); err == nil {
@@ -114,28 +120,28 @@ var _ = Describe("LitestreamReplica Controller", func() {
 		}).Should(Succeed())
 	})
 
-	It("should set SidecarInjected condition after annotation", func() {
+	It("should set TargetReady condition after annotation", func() {
 		Eventually(func(g Gomega) {
 			db := &databasev1.LitestreamReplica{}
 			g.Expect(k8sClient.Get(ctx, namespacedName, db)).To(Succeed())
-			cond := meta.FindStatusCondition(db.Status.Conditions, databasev1.ConditionSidecarInjected)
+			cond := meta.FindStatusCondition(db.Status.Conditions, databasev1.ConditionTargetReady)
 			g.Expect(cond).NotTo(BeNil())
 			g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		}).Should(Succeed())
 	})
 
-	It("should set BackupHealthy condition to False when backup is disabled", func() {
+	It("should set ReplicationHealthy condition to False when backup is disabled", func() {
 		Eventually(func(g Gomega) {
 			db := &databasev1.LitestreamReplica{}
 			g.Expect(k8sClient.Get(ctx, namespacedName, db)).To(Succeed())
-			cond := meta.FindStatusCondition(db.Status.Conditions, databasev1.ConditionBackupHealthy)
+			cond := meta.FindStatusCondition(db.Status.Conditions, databasev1.ConditionReplicationHealthy)
 			g.Expect(cond).NotTo(BeNil())
 			g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			g.Expect(cond.Reason).To(Equal("BackupDisabled"))
 		}).Should(Succeed())
 	})
 
-	It("should set BackupHealthy to False when no Litestream pods exist yet", func() {
+	It("should set ReplicationHealthy to False when no Litestream pods exist yet", func() {
 		// Wait for initial reconcile, then enable backup.
 		Eventually(func(g Gomega) {
 			db := &databasev1.LitestreamReplica{}
@@ -156,7 +162,7 @@ var _ = Describe("LitestreamReplica Controller", func() {
 		Eventually(func(g Gomega) {
 			db := &databasev1.LitestreamReplica{}
 			g.Expect(k8sClient.Get(ctx, namespacedName, db)).To(Succeed())
-			cond := meta.FindStatusCondition(db.Status.Conditions, databasev1.ConditionBackupHealthy)
+			cond := meta.FindStatusCondition(db.Status.Conditions, databasev1.ConditionReplicationHealthy)
 			g.Expect(cond).NotTo(BeNil())
 			g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			g.Expect(cond.Reason).To(Equal("SidecarUnhealthy"))
@@ -325,78 +331,66 @@ var _ = Describe("LitestreamReplica Controller", func() {
 		})
 	})
 
-	Context("init SQL management", func() {
-		const initSQL = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY);"
+	Context("bootstrap SQL management", func() {
+		const bootstrapSQL = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY);"
 
-		// setInitSQL is a retry-safe helper that updates spec.InitSQL on the test
+		// setBootstrapSQL is a retry-safe helper that updates spec.Bootstrap.SQL on the test
 		// LitestreamReplica, re-fetching on conflict to avoid 409 races with the background
 		// reconciler that may patch status between the Get and Update.
-		setInitSQL := func(sql string) {
+		setBootstrapSQL := func(sql string) {
 			Eventually(func() error {
 				db := &databasev1.LitestreamReplica{}
 				if err := k8sClient.Get(ctx, namespacedName, db); err != nil {
 					return err
 				}
-				db.Spec.InitSQL = sql
+				db.Spec.Bootstrap.SQL = sql
 				return k8sClient.Update(ctx, db)
 			}).Should(Succeed())
 		}
 
-		It("creates the init-sql ConfigMap when InitSQL is set", func() {
-			setInitSQL(initSQL)
+		It("creates the bootstrap-sql ConfigMap when Bootstrap.SQL is set", func() {
+			setBootstrapSQL(bootstrapSQL)
 
 			Eventually(func(g Gomega) {
 				cm := &corev1.ConfigMap{}
 				g.Expect(k8sClient.Get(ctx, types.NamespacedName{
-					Name: resourceName + "-init-sql", Namespace: namespaceName,
+					Name: resourceName + "-bootstrap-sql", Namespace: namespaceName,
 				}, cm)).To(Succeed())
-				g.Expect(cm.Data["init.sql"]).To(Equal(initSQL))
+				g.Expect(cm.Data["bootstrap.sql"]).To(Equal(bootstrapSQL))
 			}).Should(Succeed())
 		})
 
-		It("records the SHA-256 hash in status.InitSQLHash", func() {
-			setInitSQL(initSQL)
+		It("updates the ConfigMap when Bootstrap.SQL changes", func() {
+			setBootstrapSQL(bootstrapSQL)
 
 			Eventually(func(g Gomega) {
-				db := &databasev1.LitestreamReplica{}
-				g.Expect(k8sClient.Get(ctx, namespacedName, db)).To(Succeed())
-				g.Expect(db.Status.InitSQLHash).To(Equal(initSQLHash(initSQL)))
-			}).Should(Succeed())
-		})
-
-		It("updates the ConfigMap and hash when InitSQL changes", func() {
-			setInitSQL(initSQL)
-
-			Eventually(func(g Gomega) {
-				db := &databasev1.LitestreamReplica{}
-				g.Expect(k8sClient.Get(ctx, namespacedName, db)).To(Succeed())
-				g.Expect(db.Status.InitSQLHash).To(Equal(initSQLHash(initSQL)))
+				cm := &corev1.ConfigMap{}
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{
+					Name: resourceName + "-bootstrap-sql", Namespace: namespaceName,
+				}, cm)).To(Succeed())
+				g.Expect(cm.Data["bootstrap.sql"]).To(Equal(bootstrapSQL))
 			}).Should(Succeed())
 
 			// Change the SQL (retry-safe).
-			newSQL := initSQL + "\nCREATE TABLE IF NOT EXISTS posts (id INTEGER PRIMARY KEY);"
-			setInitSQL(newSQL)
+			newSQL := bootstrapSQL + "\nCREATE TABLE IF NOT EXISTS posts (id INTEGER PRIMARY KEY);"
+			setBootstrapSQL(newSQL)
 
 			Eventually(func(g Gomega) {
 				cm := &corev1.ConfigMap{}
 				g.Expect(k8sClient.Get(ctx, types.NamespacedName{
-					Name: resourceName + "-init-sql", Namespace: namespaceName,
+					Name: resourceName + "-bootstrap-sql", Namespace: namespaceName,
 				}, cm)).To(Succeed())
-				g.Expect(cm.Data["init.sql"]).To(Equal(newSQL))
-
-				db := &databasev1.LitestreamReplica{}
-				g.Expect(k8sClient.Get(ctx, namespacedName, db)).To(Succeed())
-				g.Expect(db.Status.InitSQLHash).To(Equal(initSQLHash(newSQL)))
+				g.Expect(cm.Data["bootstrap.sql"]).To(Equal(newSQL))
 			}).Should(Succeed())
 		})
 
-		It("sets InitSQLApplied condition to True when ConfigMap is ready", func() {
-			setInitSQL(initSQL)
+		It("sets BootstrapApplied condition to True when ConfigMap is ready", func() {
+			setBootstrapSQL(bootstrapSQL)
 
 			Eventually(func(g Gomega) {
 				db := &databasev1.LitestreamReplica{}
 				g.Expect(k8sClient.Get(ctx, namespacedName, db)).To(Succeed())
-				cond := meta.FindStatusCondition(db.Status.Conditions, databasev1.ConditionInitSQLApplied)
+				cond := meta.FindStatusCondition(db.Status.Conditions, databasev1.ConditionBootstrapApplied)
 				g.Expect(cond).NotTo(BeNil())
 				g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 				g.Expect(cond.Reason).To(Equal("ConfigMapReady"))
@@ -625,6 +619,7 @@ var _ = Describe("litestreamContainerState and archiveCheckState", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: lsDepName, Namespace: lsTestNamespace},
 			Spec: appsv1.DeploymentSpec{
 				Replicas: &replicas,
+				Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
 				Selector: &metav1.LabelSelector{
 					MatchLabels: map[string]string{"app": lsDepName},
 				},
@@ -865,15 +860,19 @@ var _ = Describe("LitestreamReplica Controller with StatefulSet target", func() 
 	})
 
 	AfterEach(func() {
-		for _, name := range []string{stsResourceName + "-litestream", stsResourceName + "-init-sql"} {
+		for _, name := range []string{stsResourceName + "-litestream", stsResourceName + "-bootstrap-sql"} {
 			cm := &corev1.ConfigMap{}
 			if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespaceName}, cm); err == nil {
 				_ = k8sClient.Delete(ctx, cm)
 			}
 		}
+		stsDBKey := types.NamespacedName{Name: stsResourceName, Namespace: namespaceName}
 		db := &databasev1.LitestreamReplica{}
-		if err := k8sClient.Get(ctx, namespacedName, db); err == nil {
+		if err := k8sClient.Get(ctx, stsDBKey, db); err == nil {
 			Expect(k8sClient.Delete(ctx, db)).To(Succeed())
+			Eventually(func() bool {
+				return errors.IsNotFound(k8sClient.Get(ctx, stsDBKey, db))
+			}).Should(BeTrue())
 		}
 		sts := &appsv1.StatefulSet{}
 		if err := k8sClient.Get(ctx, stsKey, sts); err == nil {
@@ -900,11 +899,11 @@ var _ = Describe("LitestreamReplica Controller with StatefulSet target", func() 
 		}).Should(Succeed())
 	})
 
-	It("sets SidecarInjected condition after annotating StatefulSet", func() {
+	It("sets TargetReady condition after annotating StatefulSet", func() {
 		Eventually(func(g Gomega) {
 			db := &databasev1.LitestreamReplica{}
 			g.Expect(k8sClient.Get(ctx, namespacedName, db)).To(Succeed())
-			cond := meta.FindStatusCondition(db.Status.Conditions, databasev1.ConditionSidecarInjected)
+			cond := meta.FindStatusCondition(db.Status.Conditions, databasev1.ConditionTargetReady)
 			g.Expect(cond).NotTo(BeNil())
 			g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		}).Should(Succeed())
@@ -950,11 +949,93 @@ var _ = Describe("workloadTarget helpers", func() {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// reconcileInitSQLConfig edge-case tests — use k8sClient but call the method
+// patchWorkloadPodTemplate edge-case tests — nil Labels on pod template.
+// ─────────────────────────────────────────────────────────────────────────────
+
+var _ = Describe("patchWorkloadPodTemplate nil-Labels paths", func() {
+	const patchNS = "default"
+	ctx := context.Background()
+
+	newR := func() *LitestreamReplicaReconciler {
+		return &LitestreamReplicaReconciler{
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: record.NewFakeRecorder(10),
+		}
+	}
+
+	It("initialises nil Labels on a Deployment pod template", func() {
+		dep := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "patch-dep-nil-labels", Namespace: patchNS},
+			Spec: appsv1.DeploymentSpec{
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": "patch-dep-nil-labels"},
+				},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{"app": "patch-dep-nil-labels"},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "app", Image: "busybox"}},
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, dep)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, dep) }()
+
+		// Clear Labels to nil after creation so the guard branch fires.
+		dep.Spec.Template.Labels = nil
+		wt := &workloadTarget{deployment: dep}
+		Expect(newR().patchWorkloadPodTemplate(ctx, wt,
+			map[string]string{"ann-key": "ann-val"},
+			map[string]string{"label-key": "label-val"},
+		)).To(Succeed())
+
+		updated := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(dep), updated)).To(Succeed())
+		Expect(updated.Spec.Template.Labels).To(HaveKeyWithValue("label-key", "label-val"))
+	})
+
+	It("initialises nil Labels on a StatefulSet pod template", func() {
+		ss := &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{Name: "patch-ss-nil-labels", Namespace: patchNS},
+			Spec: appsv1.StatefulSetSpec{
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": "patch-ss-nil-labels"},
+				},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{"app": "patch-ss-nil-labels"},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "app", Image: "busybox"}},
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, ss) }()
+
+		ss.Spec.Template.Labels = nil
+		wt := &workloadTarget{statefulSet: ss}
+		Expect(newR().patchWorkloadPodTemplate(ctx, wt,
+			map[string]string{"ann-key": "ann-val"},
+			map[string]string{"label-key": "label-val"},
+		)).To(Succeed())
+
+		updated := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ss), updated)).To(Succeed())
+		Expect(updated.Spec.Template.Labels).To(HaveKeyWithValue("label-key", "label-val"))
+	})
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// reconcileBootstrapConfig edge-case tests — use k8sClient but call the method
 // directly to cover paths the background manager exercises only asynchronously.
 // ─────────────────────────────────────────────────────────────────────────────
 
-var _ = Describe("LitestreamReplica Controller reconcileInitSQLConfig edge cases", func() {
+var _ = Describe("LitestreamReplica Controller reconcileBootstrapConfig edge cases", func() {
 	const (
 		hashDBName = "hash-edge-db"
 		hashNS     = "default"
@@ -976,7 +1057,7 @@ var _ = Describe("LitestreamReplica Controller reconcileInitSQLConfig edge cases
 		if err := k8sClient.Get(ctx, dbKey, db); err == nil {
 			_ = k8sClient.Delete(ctx, db)
 		}
-		for _, name := range []string{hashDBName + "-litestream", hashDBName + "-init-sql"} {
+		for _, name := range []string{hashDBName + "-litestream", hashDBName + "-bootstrap-sql"} {
 			cm := &corev1.ConfigMap{}
 			if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: hashNS}, cm); err == nil {
 				_ = k8sClient.Delete(ctx, cm)
@@ -984,7 +1065,7 @@ var _ = Describe("LitestreamReplica Controller reconcileInitSQLConfig edge cases
 		}
 	})
 
-	It("clears InitSQLHash when InitSQL is removed from a CR that previously had it", func() {
+	It("is a no-op when Bootstrap.SQL is empty", func() {
 		db := &databasev1.LitestreamReplica{
 			ObjectMeta: metav1.ObjectMeta{Name: hashDBName, Namespace: hashNS},
 			Spec: databasev1.LitestreamReplicaSpec{
@@ -995,52 +1076,30 @@ var _ = Describe("LitestreamReplica Controller reconcileInitSQLConfig edge cases
 		}
 		Expect(k8sClient.Create(ctx, db)).To(Succeed())
 
-		// Manually set a stale InitSQLHash in status.
-		patch := client.MergeFrom(db.DeepCopy())
-		db.Status.InitSQLHash = "stale-hash-value"
-		Expect(k8sClient.Status().Patch(ctx, db, patch)).To(Succeed())
-
-		// Reconcile — InitSQL is empty, hash should be cleared.
 		r := newReconciler()
-		Expect(r.reconcileInitSQLConfig(ctx, db)).To(Succeed())
-
-		// Re-fetch to see the status update.
-		updated := &databasev1.LitestreamReplica{}
-		Eventually(func(g Gomega) {
-			g.Expect(k8sClient.Get(ctx, dbKey, updated)).To(Succeed())
-			g.Expect(updated.Status.InitSQLHash).To(BeEmpty())
-		}).Should(Succeed())
+		Expect(r.reconcileBootstrapConfig(ctx, db)).To(Succeed())
 	})
 
-	It("is a no-op on second reconcile when hash is unchanged", func() {
+	It("creates bootstrap-sql ConfigMap when Bootstrap.SQL is set", func() {
 		db := &databasev1.LitestreamReplica{
 			ObjectMeta: metav1.ObjectMeta{Name: hashDBName, Namespace: hashNS},
 			Spec: databasev1.LitestreamReplicaSpec{
 				DatabaseName:     "app.db",
 				DatabasePath:     "/data",
 				TargetDeployment: "nonexistent",
-				InitSQL:          someSQL,
+				Bootstrap:        databasev1.BootstrapSpec{SQL: someSQL},
 			},
 		}
 		Expect(k8sClient.Create(ctx, db)).To(Succeed())
 
 		r := newReconciler()
-		// First reconcile: creates ConfigMap, writes hash.
-		// Eventually retries on 409 — the background manager may race to create
-		// the same ConfigMap when it picks up the new LitestreamReplica object.
 		Eventually(func() error {
-			return r.reconcileInitSQLConfig(ctx, db)
+			return r.reconcileBootstrapConfig(ctx, db)
 		}).Should(Succeed())
 
-		// Re-fetch to get the updated status.
-		Expect(k8sClient.Get(ctx, dbKey, db)).To(Succeed())
-		firstHash := db.Status.InitSQLHash
-		Expect(firstHash).NotTo(BeEmpty())
-
-		// Second reconcile: hash is already written — should be a no-op.
-		Expect(r.reconcileInitSQLConfig(ctx, db)).To(Succeed())
-		Expect(k8sClient.Get(ctx, dbKey, db)).To(Succeed())
-		Expect(db.Status.InitSQLHash).To(Equal(firstHash))
+		cm := &corev1.ConfigMap{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: hashDBName + "-bootstrap-sql", Namespace: hashNS}, cm)).To(Succeed())
+		Expect(cm.Data["bootstrap.sql"]).To(Equal(someSQL))
 	})
 })
 
@@ -1082,7 +1141,7 @@ var _ = Describe("LitestreamReplica Controller updateStatus direct tests", func(
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: dbName, Namespace: usNamespace}, updated)).To(Succeed())
 		Expect(updated.Status.Phase).To(Equal(databasev1.PhaseError))
 		Expect(updated.Status.Ready).To(BeFalse())
-		cond := meta.FindStatusCondition(updated.Status.Conditions, databasev1.ConditionSidecarInjected)
+		cond := meta.FindStatusCondition(updated.Status.Conditions, databasev1.ConditionSidecarReady)
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(cond.Reason).To(Equal("WorkloadNotFound"))
@@ -1096,6 +1155,7 @@ var _ = Describe("LitestreamReplica Controller updateStatus direct tests", func(
 			ObjectMeta: metav1.ObjectMeta{Name: depName, Namespace: usNamespace},
 			Spec: appsv1.DeploymentSpec{
 				Replicas: &replicas,
+				Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
 				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": depName}},
 				Template: corev1.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": depName}},

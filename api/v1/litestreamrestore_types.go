@@ -20,36 +20,85 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// RestoreMode determines how a restore is executed.
+// +kubebuilder:validation:Enum=InPlace;ToPVC
+type RestoreMode string
+
+const (
+	// RestoreModeInPlace derives workload, PVC, and database path from the
+	// source LitestreamReplica. Fences the application, restores, resumes.
+	RestoreModeInPlace RestoreMode = "InPlace"
+
+	// RestoreModeToPVC restores to a separate PVC without touching the
+	// source application workload.
+	RestoreModeToPVC RestoreMode = "ToPVC"
+)
+
+// RestoreSourceRef identifies the LitestreamReplica that provides the
+// backup configuration (S3 destination + credentials).
+type RestoreSourceRef struct {
+	// Name is the name of the LitestreamReplica CR in the same namespace.
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+}
+
+// RestoreTarget specifies the PVC and path for ToPVC restores.
+type RestoreTarget struct {
+	// PVC is the name of the PersistentVolumeClaim to restore into.
+	// +kubebuilder:validation:Required
+	PVC string `json:"pvc"`
+
+	// Path is the full path (including filename) where the restored
+	// database file will be written inside the PVC.
+	// +kubebuilder:validation:Required
+	Path string `json:"path"`
+}
+
 // RestorePhase constants for LitestreamRestoreStatus.Phase.
 const (
-	RestorePhasePending     = "Pending"
-	RestorePhasePausing     = "Pausing"     // pause annotation set, waiting for ConfigMap propagation
-	RestorePhaseScalingDown = "ScalingDown" // Deployment scaled to 0, waiting for pods to terminate
-	RestorePhaseRunning     = "Running"
-	RestorePhaseValidating  = "Validating" // restore Job done; running PRAGMA quick_check integrity check
-	RestorePhaseScalingUp   = "ScalingUp"  // restore validated, scaling Deployment back up
-	RestorePhaseComplete    = "Complete"
-	RestorePhaseFailed      = "Failed"
+	RestorePhasePending       = "Pending"
+	RestorePhaseAcquiringLock = "AcquiringLock" // acquiring restore lock (placeholder for Phase 3)
+	RestorePhaseFencing       = "Fencing"       // pausing replication + scaling workload to 0
+	RestorePhaseRestoring     = "Restoring"     // restore Job running
+	RestorePhaseValidating    = "Validating"    // PRAGMA quick_check integrity check
+	RestorePhaseResuming      = "Resuming"      // scaling workload back up
+	RestorePhaseCompleted     = "Completed"
+	RestorePhaseFailed        = "Failed"
+)
+
+// Restore condition type constants.
+const (
+	// RestoreConditionLocked indicates the restore has acquired its lock.
+	RestoreConditionLocked = "Locked"
+
+	// RestoreConditionApplicationFenced indicates the source application is fenced.
+	RestoreConditionApplicationFenced = "ApplicationFenced"
+
+	// RestoreConditionRestoreSucceeded indicates the restore Job completed successfully.
+	RestoreConditionRestoreSucceeded = "RestoreSucceeded"
+
+	// RestoreConditionApplicationResumed indicates the source application has been resumed.
+	RestoreConditionApplicationResumed = "ApplicationResumed"
 )
 
 // LitestreamRestoreSpec defines the desired state of a LitestreamRestore operation.
 type LitestreamRestoreSpec struct {
-	// SourceRef is the name of the LitestreamReplica CR whose backup configuration
+	// SourceRef identifies the LitestreamReplica whose backup configuration
 	// (S3 destination + credentials) should be used as the restore source.
 	// The LitestreamReplica must be in the same namespace.
 	// +kubebuilder:validation:Required
-	SourceRef string `json:"sourceRef"`
+	SourceRef RestoreSourceRef `json:"sourceRef"`
 
-	// TargetPVC is the name of the PersistentVolumeClaim that the restored
-	// database file will be written into. The PVC must already exist.
-	// +kubebuilder:validation:Required
-	TargetPVC string `json:"targetPVC"`
+	// Mode selects the restore strategy.
+	// InPlace: derives target from source LitestreamReplica, fences app, restores, resumes.
+	// ToPVC: restores to a separate PVC without touching the source application.
+	// +kubebuilder:default=InPlace
+	Mode RestoreMode `json:"mode,omitempty"`
 
-	// TargetPath is the full path (including filename) where the restored
-	// database file will be written inside the TargetPVC.
-	// Example: "/data/paperless.db"
-	// +kubebuilder:validation:Required
-	TargetPath string `json:"targetPath"`
+	// Target is required when mode is ToPVC. Specifies the PVC and path
+	// for the restored database.
+	// +optional
+	Target *RestoreTarget `json:"target,omitempty"`
 
 	// Timestamp enables point-in-time recovery. When set, Litestream restores
 	// the database to the state it was in at this instant.
@@ -70,15 +119,10 @@ type LitestreamRestoreSpec struct {
 	Force bool `json:"force,omitempty"`
 
 	// RunAsUser sets the UID for both the restore Job and the validation Job pods.
-	// When omitted, the container image's default user is used (root for the standard
-	// litestream image). Set this to match your application's UID (e.g. 1000) so that
-	// the restored file is readable by non-root containers and to satisfy PSA Restricted
-	// namespaces which reject runAsUser: 0.
 	// +optional
 	RunAsUser *int64 `json:"runAsUser,omitempty"`
 
 	// RunAsGroup sets the GID for both the restore Job and the validation Job pods.
-	// When omitted, the container image's default group is used.
 	// +optional
 	RunAsGroup *int64 `json:"runAsGroup,omitempty"`
 }
@@ -104,12 +148,23 @@ type LitestreamRestoreStatus struct {
 	// Message contains a human-readable description of the current phase,
 	// including any error details on failure.
 	Message string `json:"message,omitempty"`
+
+	// ResolvedPVC is the PVC name used for the restore, resolved at reconcile time.
+	ResolvedPVC string `json:"resolvedPVC,omitempty"`
+
+	// ResolvedPath is the database path used for the restore, resolved at reconcile time.
+	ResolvedPath string `json:"resolvedPath,omitempty"`
+
+	// Conditions holds standard Kubernetes condition entries.
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:printcolumn:name="Source",type=string,JSONPath=".spec.sourceRef"
-// +kubebuilder:printcolumn:name="TargetPVC",type=string,JSONPath=".spec.targetPVC"
+// +kubebuilder:printcolumn:name="Source",type=string,JSONPath=".spec.sourceRef.name"
+// +kubebuilder:printcolumn:name="Mode",type=string,JSONPath=".spec.mode"
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=".status.phase"
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 
