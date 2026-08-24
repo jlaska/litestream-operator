@@ -206,11 +206,19 @@ kubectl annotate litestreamreplica my-app-db litestream.io/pause- -n my-app
 
 ### Skip archive check
 
-Set `litestream.io/skip-archive-check: "true"` on the LitestreamReplica CR to bypass the archive-check init container. Use when intentionally starting fresh against an existing S3 backup chain.
+The archive-check init container is **automatically skipped** after an InPlace
+`LitestreamRestore` completes — the restore controller sets the annotation and
+the webhook also checks for a recently completed restore as a fallback. No
+manual intervention is needed for the normal restore flow.
+
+For manual bypass (e.g., intentionally starting fresh against an existing S3
+backup chain), set the annotation on the LitestreamReplica CR:
 
 ```bash
 kubectl annotate litestreamreplica my-app-db litestream.io/skip-archive-check=true -n my-app
 ```
+
+The annotation is automatically cleared once the Litestream sidecar is healthy.
 
 ## Troubleshooting
 

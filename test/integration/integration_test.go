@@ -2092,7 +2092,6 @@ func litestreamReplicaManifestWithContainer(name, ns, target, dbFile, dbPath, co
 	return string(data)
 }
 
-
 func litestreamRestoreInPlaceManifestWithOpts(name, ns, sourceRef string, force bool) string {
 	restore := &databasev1.LitestreamRestore{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "litestream.io/v1", Kind: "LitestreamRestore"},

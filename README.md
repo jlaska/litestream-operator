@@ -376,7 +376,7 @@ The operator uses these annotations on target workloads:
 | `litestream.io/config` | References the LitestreamReplica CR (`namespace/name`) that configures injection |
 | `litestream.io/injection-spec-hash` | Deterministic hash of injection-relevant config; changes trigger rollouts |
 | `litestream.io/pause` | When `"true"` on a CR, pauses replication without killing the sidecar |
-| `litestream.io/skip-archive-check` | When `"true"` on a CR, disables the archive-check init container |
+| `litestream.io/skip-archive-check` | When `"true"` on a CR, disables the archive-check init container. Set automatically by the restore controller after an InPlace restore; cleared once the sidecar is healthy |
 
 ---
 
