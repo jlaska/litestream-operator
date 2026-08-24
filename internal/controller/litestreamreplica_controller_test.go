@@ -949,6 +949,88 @@ var _ = Describe("workloadTarget helpers", func() {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
+// patchWorkloadPodTemplate edge-case tests — nil Labels on pod template.
+// ─────────────────────────────────────────────────────────────────────────────
+
+var _ = Describe("patchWorkloadPodTemplate nil-Labels paths", func() {
+	const patchNS = "default"
+	ctx := context.Background()
+
+	newR := func() *LitestreamReplicaReconciler {
+		return &LitestreamReplicaReconciler{
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: record.NewFakeRecorder(10),
+		}
+	}
+
+	It("initialises nil Labels on a Deployment pod template", func() {
+		dep := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "patch-dep-nil-labels", Namespace: patchNS},
+			Spec: appsv1.DeploymentSpec{
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": "patch-dep-nil-labels"},
+				},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{"app": "patch-dep-nil-labels"},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "app", Image: "busybox"}},
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, dep)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, dep) }()
+
+		// Clear Labels to nil after creation so the guard branch fires.
+		dep.Spec.Template.Labels = nil
+		wt := &workloadTarget{deployment: dep}
+		Expect(newR().patchWorkloadPodTemplate(ctx, wt,
+			map[string]string{"ann-key": "ann-val"},
+			map[string]string{"label-key": "label-val"},
+		)).To(Succeed())
+
+		updated := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(dep), updated)).To(Succeed())
+		Expect(updated.Spec.Template.Labels).To(HaveKeyWithValue("label-key", "label-val"))
+	})
+
+	It("initialises nil Labels on a StatefulSet pod template", func() {
+		ss := &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{Name: "patch-ss-nil-labels", Namespace: patchNS},
+			Spec: appsv1.StatefulSetSpec{
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": "patch-ss-nil-labels"},
+				},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{"app": "patch-ss-nil-labels"},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "app", Image: "busybox"}},
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, ss) }()
+
+		ss.Spec.Template.Labels = nil
+		wt := &workloadTarget{statefulSet: ss}
+		Expect(newR().patchWorkloadPodTemplate(ctx, wt,
+			map[string]string{"ann-key": "ann-val"},
+			map[string]string{"label-key": "label-val"},
+		)).To(Succeed())
+
+		updated := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ss), updated)).To(Succeed())
+		Expect(updated.Spec.Template.Labels).To(HaveKeyWithValue("label-key", "label-val"))
+	})
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
 // reconcileBootstrapConfig edge-case tests — use k8sClient but call the method
 // directly to cover paths the background manager exercises only asynchronously.
 // ─────────────────────────────────────────────────────────────────────────────

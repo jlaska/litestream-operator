@@ -1439,6 +1439,37 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		_ = restoreKey
 	})
 
+	// scaleWorkload: StatefulSet already at target replica count (early return, no patch).
+	It("scaleWorkload is a no-op when StatefulSet is already at the target replica count", func() {
+		const ssName = "scale-noop-ss"
+		replicas := int32(1)
+		ss := &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{Name: ssName, Namespace: namespaceName},
+			Spec: appsv1.StatefulSetSpec{
+				Replicas: &replicas,
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": ssName},
+				},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": ssName}},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "app", Image: "busybox"}},
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, ss) }()
+
+		r := newReconciler()
+		wt := &workloadTarget{statefulSet: ss}
+		Expect(r.scaleWorkload(ctx, wt, 1)).To(Succeed())
+
+		updated := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ss), updated)).To(Succeed())
+		Expect(*updated.Spec.Replicas).To(Equal(int32(1)))
+	})
+
 	// Reconcile — backup.enabled=true but S3 destination is nil (second failRestore path).
 	It("fails immediately when source LitestreamReplica has backup enabled but no S3 destination", func() { //nolint:dupl
 		const noS3DB = "no-s3-db"
