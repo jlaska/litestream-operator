@@ -55,6 +55,7 @@ type LitestreamRestoreReconciler struct {
 	Scheme     *runtime.Scheme
 	Recorder   record.EventRecorder
 	KubeClient kubernetes.Interface
+	APIReader  client.Reader
 }
 
 // +kubebuilder:rbac:groups=litestream.io,resources=litestreamrestores,verbs=get;list;watch;create;update;patch;delete
@@ -560,10 +561,6 @@ func (r *LitestreamRestoreReconciler) reconcileRestoring(ctx context.Context, re
 func (r *LitestreamRestoreReconciler) reconcileResuming(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	if err := r.setSkipArchiveCheck(ctx, sourceDB, true); err != nil {
-		return ctrl.Result{}, fmt.Errorf("setting skip-archive-check on LitestreamReplica: %w", err)
-	}
-
 	if err := r.resumeReplication(ctx, sourceDB); err != nil {
 		return ctrl.Result{}, fmt.Errorf("removing pause annotation from LitestreamReplica: %w", err)
 	}
@@ -578,6 +575,25 @@ func (r *LitestreamRestoreReconciler) reconcileResuming(ctx context.Context, res
 	}
 	if cm.Data[litestreamConfigKey] == pausedConfig {
 		log.Info("Waiting for ConfigMap to reflect unpaused state before scaling up")
+		return ctrl.Result{RequeueAfter: restoreRequeueInterval}, nil
+	}
+
+	// Set skip-archive-check and verify it's visible to the API server before
+	// scaling up. The annotation is set via merge patch, but a concurrent
+	// Status().Patch from the replica controller can cause the informer cache
+	// to lose the annotation. We use the uncached APIReader for both the set
+	// and the verify to ensure the annotation is durably on the API server.
+	if err := r.setSkipArchiveCheck(ctx, sourceDB, true); err != nil {
+		return ctrl.Result{}, fmt.Errorf("setting skip-archive-check on LitestreamReplica: %w", err)
+	}
+	verify := &databasev1.LitestreamReplica{}
+	if err := r.APIReader.Get(ctx, types.NamespacedName{
+		Namespace: sourceDB.Namespace, Name: sourceDB.Name,
+	}, verify); err != nil {
+		return ctrl.Result{RequeueAfter: restoreRequeueInterval}, nil
+	}
+	if verify.Annotations[databasev1.AnnotationSkipArchiveCheck] != injectEnabled {
+		log.Info("skip-archive-check annotation not yet visible on API server; requeueing")
 		return ctrl.Result{RequeueAfter: restoreRequeueInterval}, nil
 	}
 
@@ -673,9 +689,13 @@ func (r *LitestreamRestoreReconciler) resumeReplication(ctx context.Context, db 
 }
 
 // setSkipArchiveCheck sets or removes the skip-archive-check annotation on a LitestreamReplica.
+// It uses the uncached API reader to get the latest state directly from the API
+// server, avoiding races where the informer cache returns a stale version that
+// lacks the annotation (set by a previous call) because a concurrent Status().Patch
+// response overwrote it in the cache.
 func (r *LitestreamRestoreReconciler) setSkipArchiveCheck(ctx context.Context, db *databasev1.LitestreamReplica, enable bool) error {
 	latest := &databasev1.LitestreamReplica{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: db.Namespace, Name: db.Name}, latest); err != nil {
+	if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: db.Namespace, Name: db.Name}, latest); err != nil {
 		return err
 	}
 	if enable {

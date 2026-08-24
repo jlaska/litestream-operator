@@ -642,23 +642,24 @@ var _ = Describe("Archive Check — Fresh DB Divergence", Ordered, func() {
 
 		By("writing test data to the database")
 		podName := runningPod(appName)
+		preInsertListing, _ := kubectlQ("exec", "-n", testNamespace, "mc-client", "--",
+			"/bin/sh", "-c", "mc ls --recursive local/"+s3Bucket+"/"+dbName+"/ | wc -l")
+		preInsertCount := strings.TrimSpace(preInsertListing)
+		GinkgoWriter.Printf("S3 LTX count before INSERT: %s\n", preInsertCount)
+
 		kubectl("exec", "-n", testNamespace, podName, "-c", "app",
 			"--", "sqlite3", dbPath+"/"+dbFile,
 			"INSERT INTO items(name) VALUES('"+itemValue+"');")
 
-		By("waiting for Litestream to replicate the row to MinIO")
+		By("waiting for Litestream to replicate the INSERT to S3 (new LTX file)")
 		Eventually(func(g Gomega) {
-			out := mcList(s3Bucket + "/" + dbName + "/")
-			if out == "" {
-				all, _ := kubectlQ("exec", "-n", testNamespace, "mc-client", "--",
-					"/bin/sh", "-c", "mc ls --recursive local/"+s3Bucket+"/")
-				g.Expect(out).NotTo(BeEmpty(),
-					"expected backup objects at %s/%s/ — full bucket contents:\n%s",
-					s3Bucket, dbName, all)
-			} else {
-				g.Expect(out).NotTo(BeEmpty(), "expected backup objects in MinIO bucket")
-			}
-		}, 3*time.Minute, 10*time.Second).Should(Succeed())
+			out, err := kubectlQ("exec", "-n", testNamespace, "mc-client", "--",
+				"/bin/sh", "-c", "mc ls --recursive local/"+s3Bucket+"/"+dbName+"/ | wc -l")
+			g.Expect(err).NotTo(HaveOccurred())
+			postCount := strings.TrimSpace(out)
+			g.Expect(postCount).NotTo(Equal(preInsertCount),
+				"waiting for new LTX file after INSERT (pre=%s, post=%s)", preInsertCount, postCount)
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
 	})
 
 	AfterAll(func() {
@@ -714,10 +715,6 @@ var _ = Describe("Archive Check — Fresh DB Divergence", Ordered, func() {
 
 	It("LitestreamRestore recovers data and pod restarts without archive-check false-positive", func() {
 		By("creating a LitestreamRestore CR targeting the same PVC")
-		// force=true is required here: the previous test left a placeholder DB at the target
-		// path to simulate divergence. Without -force, litestream refuses to overwrite a
-		// non-empty file. The deployment is scaled to 0 by the restore controller before
-		// the Job runs, so overwriting is safe.
 		applyLiteral(litestreamRestoreManifestWithForce("diverge-check-restore", testNamespace, dbName, pvcName, dbPath+"/"+dbFile))
 
 		By("waiting for restore to reach Complete phase")
@@ -2304,9 +2301,29 @@ func dumpReplicationDiagnostics(appName, dbName, dbFile string) {
 		journal, _ := kubectlQ("exec", "-n", testNamespace, podName, "-c", "app",
 			"--", "sqlite3", "/data/"+dbFile, "PRAGMA journal_mode;")
 		GinkgoWriter.Printf("--- SQLite journal_mode ---\n%s\n", journal)
+
+		initStatuses, _ := kubectlQ("get", "pod", podName, "-n", testNamespace,
+			"-o", `jsonpath={range .status.initContainerStatuses[*]}{.name}={.state}{"\n"}{end}`)
+		GinkgoWriter.Printf("--- Init container statuses ---\n%s\n", initStatuses)
+
+		initNames, _ := kubectlQ("get", "pod", podName, "-n", testNamespace,
+			"-o", `jsonpath={range .spec.initContainers[*]}{.name}{"\n"}{end}`)
+		GinkgoWriter.Printf("--- Init containers in spec ---\n%s\n", initNames)
+
+		for _, name := range strings.Split(strings.TrimSpace(initNames), "\n") {
+			if name == "" {
+				continue
+			}
+			initLogs, _ := kubectlQ("logs", "-n", testNamespace, podName, "-c", name, "--tail=20")
+			GinkgoWriter.Printf("--- Init container %s logs ---\n%s\n", name, initLogs)
+		}
 	} else {
 		GinkgoWriter.Printf("--- no running pod found for app=%s ---\n", appName)
 	}
+
+	annotations, _ := kubectlQ("get", "litestreamreplica", dbName, "-n", testNamespace,
+		"-o", "jsonpath={.metadata.annotations}")
+	GinkgoWriter.Printf("--- LitestreamReplica annotations ---\n%s\n", annotations)
 
 	// 2. Litestream ConfigMap content (named after the CR, not the db file).
 	cm, _ := kubectlQ("get", "configmap", dbName+"-litestream", "-n", testNamespace, "-o", "yaml")

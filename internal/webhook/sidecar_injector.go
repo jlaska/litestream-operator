@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	databasev1 "github.com/jlaska/litestream-operator/api/v1"
@@ -96,6 +97,18 @@ func (s *SidecarInjector) Handle(ctx context.Context, req admission.Request) adm
 	}
 	if db == nil {
 		return admission.Allowed("no LitestreamReplica config reference found")
+	}
+
+	// Check if a recently completed restore should suppress archive-check.
+	// This is a fallback for the skip-archive-check annotation, which can be
+	// lost due to races between the restore and replica controllers.
+	if db.Annotations[databasev1.AnnotationSkipArchiveCheck] != injectTrue {
+		if s.hasActiveRestore(ctx, db) {
+			if db.Annotations == nil {
+				db.Annotations = make(map[string]string)
+			}
+			db.Annotations[databasev1.AnnotationSkipArchiveCheck] = injectTrue
+		}
 	}
 
 	// Inject the sidecar and return the patch.
@@ -594,4 +607,27 @@ func (s *SidecarInjector) findVolumeForPath(pod *corev1.Pod, dbPath, containerNa
 		mountPath:  bestMatch.MountPath,
 		subPath:    bestMatch.SubPath,
 	}, nil
+}
+
+// hasActiveRestore checks if there is a LitestreamRestore in Resuming or
+// Completed phase that references this LitestreamReplica. A recently completed
+// restore means the archive-check should be skipped because the data was just
+// restored. This is a fallback for the skip-archive-check annotation which can
+// be lost due to concurrent controller writes.
+func (s *SidecarInjector) hasActiveRestore(ctx context.Context, db *databasev1.LitestreamReplica) bool {
+	restoreList := &databasev1.LitestreamRestoreList{}
+	if err := s.Client.List(ctx, restoreList, client.InNamespace(db.Namespace)); err != nil {
+		logf.FromContext(ctx).V(1).Info("Failed to list LitestreamRestores for skip-archive-check fallback", "error", err)
+		return false
+	}
+	for _, restore := range restoreList.Items {
+		if restore.Spec.SourceRef.Name != db.Name {
+			continue
+		}
+		if restore.Status.Phase == databasev1.RestorePhaseResuming ||
+			restore.Status.Phase == databasev1.RestorePhaseCompleted {
+			return true
+		}
+	}
+	return false
 }

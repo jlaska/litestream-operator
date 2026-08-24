@@ -681,7 +681,7 @@ func (r *LitestreamReplicaReconciler) clearSkipArchiveCheck(ctx context.Context,
 		return err
 	}
 	if latest.Annotations[skipArchiveAnnotation] != injectEnabled {
-		return nil // already absent
+		return nil
 	}
 	patch := client.MergeFrom(latest.DeepCopy())
 	delete(latest.Annotations, skipArchiveAnnotation)
