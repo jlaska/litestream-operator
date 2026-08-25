@@ -38,7 +38,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
-        run: gh pr merge "$PR_URL" --admin --squash
+        run: gh pr merge "$PR_URL" --auto --squash
 
       - name: Merge approved major updates
         if: |
@@ -48,4 +48,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
-        run: gh pr merge "$PR_URL" --admin --squash
+        run: gh pr merge "$PR_URL" --auto --squash
