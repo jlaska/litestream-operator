@@ -111,6 +111,7 @@ make version-bump-major  # v0.4.2 → v1.0.0
 ## CI/CD Pipeline
 
 GitHub Actions runs on:
+
 - **Push to main**: Builds and runs tests
 - **Pull requests**: Runs tests and linting
 - **Push tags (v*)**: Builds, pushes container image, creates GitHub release
@@ -145,7 +146,7 @@ This triggers the CI pipeline to build the image, push to GHCR, and create a Git
 
 ## Project Structure
 
-```
+```text
 ├── api/v1/                    # CRD type definitions
 ├── charts/litestream-operator/ # Helm chart
 ├── cmd/main.go                # Operator entrypoint

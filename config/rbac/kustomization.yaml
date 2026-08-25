@@ -25,4 +25,3 @@ resources:
 - litestreamreplica_admin_role.yaml
 - litestreamreplica_editor_role.yaml
 - litestreamreplica_viewer_role.yaml
-

@@ -46,6 +46,7 @@ helm install litestream-operator oci://ghcr.io/jlaska/charts/litestream-operator
 > **Prerequisites**: Kubernetes >= 1.28, Helm 3, [cert-manager](https://cert-manager.io/) installed in the cluster.
 >
 > To skip cert-manager (bring your own webhook TLS secret):
+>
 > ```bash
 > helm install litestream-operator oci://ghcr.io/jlaska/charts/litestream-operator \
 >   --namespace litestream-operator-system \
@@ -128,9 +129,11 @@ kubectl describe litestreamreplica my-app-db -n example
 
 ## How it works
 
-litestream-operator is to SQLite what [CloudNativePG](https://cloudnative-pg.io) is to PostgreSQL — a Kubernetes-native orchestration layer that handles backup, lifecycle, and observability at the database layer. Litestream does for SQLite what Barman Cloud does for PostgreSQL.
+litestream-operator is to SQLite what [CloudNativePG](https://cloudnative-pg.io) is to PostgreSQL —
+a Kubernetes-native orchestration layer that handles backup, lifecycle, and observability at the database layer.
+Litestream does for SQLite what Barman Cloud does for PostgreSQL.
 
-```
+```text
 ┌─────────────────────────────────────┐
 │  Application Pod (after rollout)    │
 │                                     │
@@ -293,7 +296,9 @@ kubectl get litestreamrestore my-app-restore -n example
 
 ### Manual (default)
 
-If local state is missing or inconsistent with the remote archive, block workload startup and require an explicit `LitestreamRestore`. This is the safety-first default — a missing database with an existing archive will never silently start fresh.
+If local state is missing or inconsistent with the remote archive, block workload startup and require an explicit
+`LitestreamRestore`. This is the safety-first default — a missing database with an existing archive will never
+silently start fresh.
 
 ```yaml
 spec:
@@ -303,7 +308,9 @@ spec:
 
 ### Automatic
 
-Uses upstream Litestream's native restore with idempotent flags (`-if-db-not-exists`, `-if-replica-exists`) and integrity checking (`-integrity-check quick`). Any genuine restore failure blocks pod startup — the operator never converts a restore error into a fresh database.
+Uses upstream Litestream's native restore with idempotent flags (`-if-db-not-exists`, `-if-replica-exists`)
+and integrity checking (`-integrity-check quick`). Any genuine restore failure blocks pod startup —
+the operator never converts a restore error into a fresh database.
 
 ```yaml
 spec:
@@ -425,7 +432,7 @@ The operator emits events for operationally important transitions:
 
 The injected Litestream sidecar exposes metrics on port 9090. The webhook automatically sets Prometheus discovery annotations on the pod:
 
-```
+```yaml
 prometheus.io/scrape: "true"
 prometheus.io/port: "9090"
 prometheus.io/path: "/metrics"
@@ -460,11 +467,14 @@ Existing Prometheus annotations on the pod are preserved (not overwritten).
 **Cause**: The target Deployment uses `RollingUpdate` with `maxSurge > 0`, which can temporarily run two pods and corrupt the SQLite database.
 
 **Fix**: Change the rollout strategy:
+
 ```yaml
 strategy:
   type: Recreate
 ```
+
 or:
+
 ```yaml
 strategy:
   type: RollingUpdate

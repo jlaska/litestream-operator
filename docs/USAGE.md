@@ -72,6 +72,7 @@ The pod's init container automatically restores from the S3 archive on next star
 1. The pod starts but blocks — `RecoverySafe=False` because no local DB exists but the archive is available.
 
 2. Create an InPlace restore:
+
    ```yaml
    apiVersion: litestream.io/v1
    kind: LitestreamRestore
@@ -92,6 +93,7 @@ The pod's init container automatically restores from the S3 archive on next star
    - Resumes the application
 
 4. Monitor progress:
+
    ```bash
    kubectl get litestreamrestore recover-db -n my-app -w
    ```
@@ -101,6 +103,7 @@ The pod's init container automatically restores from the S3 archive on next star
 If a restore fails after fencing the application, the workload **remains at replicas=0**. This is intentional — starting against unverified data risks corruption.
 
 The `RestoreFailed` event and restore phase will indicate what went wrong. After investigating:
+
 - Fix the issue and create a new `LitestreamRestore`
 - Or manually verify the database and scale the workload back up
 
@@ -146,6 +149,7 @@ spec:
 ```
 
 Use cases:
+
 - **Recovery testing**: Regularly verify that backups can be restored
 - **Forensic inspection**: Examine database state at a point in time
 - **Migration**: Clone a database for migration to another system
@@ -170,6 +174,7 @@ spec:
 ```
 
 Bootstrap SQL **does not run** when:
+
 - A local database already exists
 - A database was restored from an archive
 
@@ -200,6 +205,7 @@ kubectl annotate litestreamreplica my-app-db litestream.io/pause=true -n my-app
 ```
 
 Remove to resume:
+
 ```bash
 kubectl annotate litestreamreplica my-app-db litestream.io/pause- -n my-app
 ```
@@ -227,6 +233,7 @@ The annotation is automatically cleared once the Litestream sidecar is healthy.
 **Symptom**: Pod is stuck with init containers not completing.
 
 **Diagnosis**:
+
 ```bash
 kubectl describe litestreamreplica my-app-db -n my-app
 # Look for RecoverySafe=False condition
@@ -243,6 +250,7 @@ kubectl describe litestreamreplica my-app-db -n my-app
 **Cause**: The target Deployment uses `RollingUpdate` with `maxSurge > 0`. During a rollout, two pods could run simultaneously, creating concurrent SQLite writers and risking database corruption.
 
 **Fix**:
+
 ```yaml
 # Option 1: Recreate strategy
 strategy:
@@ -269,6 +277,7 @@ strategy:
 **Symptom**: `ReplicationHealthy=False` despite Litestream sidecar running.
 
 **Diagnosis**:
+
 ```bash
 # Check Litestream sidecar logs
 kubectl logs <pod-name> -c litestream -n my-app
@@ -278,6 +287,7 @@ kubectl get litestreamreplica my-app-db -n my-app -o jsonpath='{.status.replicat
 ```
 
 **Common causes**:
+
 - S3 credentials expired or invalid
 - Object store unreachable (network issue)
 - Replication lag exceeds `spec.health.maxReplicationLag`
@@ -287,6 +297,7 @@ kubectl get litestreamreplica my-app-db -n my-app -o jsonpath='{.status.replicat
 **Cause**: Another InPlace restore is active for the same source. Only one InPlace restore can run per LitestreamReplica at a time.
 
 **Diagnosis**:
+
 ```bash
 kubectl get litestreamrestore -n my-app
 # Look for another restore in Fencing/Restoring/Resuming phase
@@ -299,6 +310,7 @@ kubectl get litestreamrestore -n my-app
 **Symptom**: Litestream sidecar logs show authentication errors. `ReplicationHealthy=False`.
 
 **Fix**: Update the Secret referenced by `spec.backup.destination.s3.secretRef`:
+
 ```bash
 kubectl create secret generic minio-creds \
   --from-literal=ACCESS_KEY_ID=<new-key> \
@@ -316,6 +328,7 @@ Then trigger a pod restart to pick up the new credentials.
 **Cause**: `spec.databasePath` doesn't match the actual mount path in the application container, or `subPath` is used but not accounted for.
 
 **Diagnosis**:
+
 ```bash
 # Check what's actually mounted
 kubectl exec <pod-name> -c <app-container> -n my-app -- ls -la /data/
@@ -324,4 +337,5 @@ kubectl exec <pod-name> -c <app-container> -n my-app -- ls -la /data/
 kubectl get configmap <cr-name>-litestream -n my-app -o yaml
 ```
 
-**Fix**: Ensure `spec.databasePath` matches the directory where the database file lives inside the application container. If the container uses `subPath`, the operator resolves it automatically — just specify the container-visible path.
+**Fix**: Ensure `spec.databasePath` matches the directory where the database file lives inside the application container.
+If the container uses `subPath`, the operator resolves it automatically — just specify the container-visible path.

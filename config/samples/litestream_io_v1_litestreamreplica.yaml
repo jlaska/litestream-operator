@@ -18,11 +18,11 @@ spec:
       email TEXT UNIQUE NOT NULL,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
-    
-    INSERT INTO users (name, email) VALUES 
+
+    INSERT INTO users (name, email) VALUES
       ('Alice', 'alice@example.com'),
       ('Bob', 'bob@example.com');
-    
+
     CREATE TABLE posts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER,
