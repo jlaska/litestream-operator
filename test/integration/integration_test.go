@@ -95,9 +95,9 @@ var _ = Describe("Integration", Ordered, func() {
 		})
 	})
 
-	// ── Scenario 2: Backup to MinIO ───────────────────────────────────────
+	// ── Scenario 2: Backup to S3 ───────────────────────────────────────
 
-	Describe("Backup to MinIO", func() {
+	Describe("Backup to S3", func() {
 		const (
 			appName = "backup-test-app"
 			dbName  = "backup-test-db"
@@ -152,7 +152,7 @@ var _ = Describe("Integration", Ordered, func() {
 			}, 2*time.Minute, 5*time.Second).Should(Succeed())
 		})
 
-		It("Litestream replicates WAL changes to the MinIO bucket", func() {
+		It("Litestream replicates WAL changes to the S3 bucket", func() {
 			podName := runningPod(appName)
 
 			By("writing a row to the database")
@@ -160,19 +160,19 @@ var _ = Describe("Integration", Ordered, func() {
 				"--", "sqlite3", dbPath+"/"+dbFile,
 				"INSERT INTO events(message) VALUES('integration-test-backup');")
 
-			By("waiting for Litestream to replicate to MinIO")
+			By("waiting for Litestream to replicate to S3")
 			Eventually(func(g Gomega) {
 				// Check the expected path first.
-				out := mcList(minioBucket + "/" + dbName + "/")
+				out := s3List(s3Bucket + "/" + dbName + "/")
 				if out == "" {
 					// Fall back: check the whole bucket so a path mismatch surfaces immediately.
-					all, _ := kubectlQ("exec", "-n", testNamespace, "mc-client", "--",
-						"/bin/sh", "-c", "mc ls --recursive local/"+minioBucket+"/")
+					all, _ := kubectlQ("exec", "-n", testNamespace, "s3-client", "--",
+						"/bin/sh", "-c", "mc ls --recursive local/"+s3Bucket+"/")
 					g.Expect(out).NotTo(BeEmpty(),
 						"expected backup objects at %s/%s/ — full bucket contents:\n%s",
-						minioBucket, dbName, all)
+						s3Bucket, dbName, all)
 				} else {
-					g.Expect(out).NotTo(BeEmpty(), "expected backup objects in MinIO bucket")
+					g.Expect(out).NotTo(BeEmpty(), "expected backup objects in S3 bucket")
 				}
 			}, 3*time.Minute, 10*time.Second).Should(Succeed())
 
@@ -467,17 +467,17 @@ var _ = Describe("Archive Check — Data Loss Recovery", Ordered, func() {
 			"--", "sqlite3", dbPath+"/"+dbFile,
 			"INSERT INTO items(name) VALUES('"+itemValue+"');")
 
-		By("waiting for Litestream to replicate the row to MinIO")
+		By("waiting for Litestream to replicate the row to S3")
 		Eventually(func(g Gomega) {
-			out := mcList(minioBucket + "/" + dbName + "/")
+			out := s3List(s3Bucket + "/" + dbName + "/")
 			if out == "" {
-				all, _ := kubectlQ("exec", "-n", testNamespace, "mc-client", "--",
-					"/bin/sh", "-c", "mc ls --recursive local/"+minioBucket+"/")
+				all, _ := kubectlQ("exec", "-n", testNamespace, "s3-client", "--",
+					"/bin/sh", "-c", "mc ls --recursive local/"+s3Bucket+"/")
 				g.Expect(out).NotTo(BeEmpty(),
 					"expected backup objects at %s/%s/ — full bucket contents:\n%s",
-					minioBucket, dbName, all)
+					s3Bucket, dbName, all)
 			} else {
-				g.Expect(out).NotTo(BeEmpty(), "expected backup objects in MinIO bucket")
+				g.Expect(out).NotTo(BeEmpty(), "expected backup objects in S3 bucket")
 			}
 		}, 3*time.Minute, 10*time.Second).Should(Succeed())
 	})
@@ -628,17 +628,17 @@ var _ = Describe("Archive Check — Fresh DB Divergence", Ordered, func() {
 			"--", "sqlite3", dbPath+"/"+dbFile,
 			"INSERT INTO items(name) VALUES('"+itemValue+"');")
 
-		By("waiting for Litestream to replicate the row to MinIO")
+		By("waiting for Litestream to replicate the row to S3")
 		Eventually(func(g Gomega) {
-			out := mcList(minioBucket + "/" + dbName + "/")
+			out := s3List(s3Bucket + "/" + dbName + "/")
 			if out == "" {
-				all, _ := kubectlQ("exec", "-n", testNamespace, "mc-client", "--",
-					"/bin/sh", "-c", "mc ls --recursive local/"+minioBucket+"/")
+				all, _ := kubectlQ("exec", "-n", testNamespace, "s3-client", "--",
+					"/bin/sh", "-c", "mc ls --recursive local/"+s3Bucket+"/")
 				g.Expect(out).NotTo(BeEmpty(),
 					"expected backup objects at %s/%s/ — full bucket contents:\n%s",
-					minioBucket, dbName, all)
+					s3Bucket, dbName, all)
 			} else {
-				g.Expect(out).NotTo(BeEmpty(), "expected backup objects in MinIO bucket")
+				g.Expect(out).NotTo(BeEmpty(), "expected backup objects in S3 bucket")
 			}
 		}, 3*time.Minute, 10*time.Second).Should(Succeed())
 	})
@@ -870,15 +870,15 @@ var _ = Describe("Auto-Restore on Startup", Ordered, func() {
 			"--", "sqlite3", dbPath+"/"+dbFile,
 			"INSERT INTO records(value) VALUES('"+testValue+"');")
 
-		By("waiting for Litestream to replicate the row to MinIO")
+		By("waiting for Litestream to replicate the row to S3")
 		Eventually(func(g Gomega) {
-			out := mcList(minioBucket + "/" + dbName + "/")
+			out := s3List(s3Bucket + "/" + dbName + "/")
 			if out == "" {
-				all, _ := kubectlQ("exec", "-n", testNamespace, "mc-client", "--",
-					"/bin/sh", "-c", "mc ls --recursive local/"+minioBucket+"/")
+				all, _ := kubectlQ("exec", "-n", testNamespace, "s3-client", "--",
+					"/bin/sh", "-c", "mc ls --recursive local/"+s3Bucket+"/")
 				g.Expect(out).NotTo(BeEmpty(),
 					"expected backup objects at %s/%s/ — full bucket contents:\n%s",
-					minioBucket, dbName, all)
+					s3Bucket, dbName, all)
 			} else {
 				g.Expect(out).NotTo(BeEmpty())
 			}
@@ -1004,10 +1004,10 @@ var _ = Describe("Restore Fails With Existing DB", Ordered, func() {
 			"--", "sqlite3", dbPath+"/"+dbFile,
 			"INSERT INTO entries(val) VALUES('"+testVal+"');")
 
-		By("waiting for replication to MinIO")
+		By("waiting for replication to S3")
 		Eventually(func(g Gomega) {
-			out := mcList(minioBucket + "/" + dbName + "/")
-			g.Expect(out).NotTo(BeEmpty(), "expected backup objects in MinIO")
+			out := s3List(s3Bucket + "/" + dbName + "/")
+			g.Expect(out).NotTo(BeEmpty(), "expected backup objects in S3")
 		}, 3*time.Minute, 10*time.Second).Should(Succeed())
 	})
 
@@ -1125,8 +1125,8 @@ var _ = Describe("Point-in-Time Restore", Ordered, func() {
 
 		By("waiting for row A to replicate and compaction to produce a restorable snapshot")
 		Eventually(func(g Gomega) {
-			out := mcList(minioBucket + "/" + dbName + "/")
-			g.Expect(out).NotTo(BeEmpty(), "expected backup objects in MinIO after row A")
+			out := s3List(s3Bucket + "/" + dbName + "/")
+			g.Expect(out).NotTo(BeEmpty(), "expected backup objects in S3 after row A")
 		}, 3*time.Minute, 10*time.Second).Should(Succeed())
 
 		// Wait for L1 compaction (default 30s) so the timestamp falls between
@@ -1143,9 +1143,9 @@ var _ = Describe("Point-in-Time Restore", Ordered, func() {
 			"--", "sqlite3", dbPath+"/"+dbFile,
 			"INSERT INTO events(val) VALUES('"+rowB+"');")
 
-		By("waiting for row B to replicate to MinIO")
+		By("waiting for row B to replicate to S3")
 		Eventually(func(g Gomega) {
-			out := mcList(minioBucket + "/" + dbName + "/")
+			out := s3List(s3Bucket + "/" + dbName + "/")
 			g.Expect(out).NotTo(BeEmpty())
 		}, 2*time.Minute, 10*time.Second).Should(Succeed())
 
@@ -1319,10 +1319,10 @@ func litestreamReplicaManifestFull(name, ns, target, dbFile, dbPath string, back
 			AutoRestore: autoRestore,
 			Destination: databasev1.BackupDestination{
 				S3: &databasev1.S3Destination{
-					Endpoint:  minioEndpoint,
-					Bucket:    minioBucket,
+					Endpoint:  s3Endpoint,
+					Bucket:    s3Bucket,
 					Path:      name + "/",
-					SecretRef: "minio-creds",
+					SecretRef: "s3-creds",
 				},
 			},
 			Retention: databasev1.RetentionPolicy{Duration: "720h"},
@@ -1486,11 +1486,11 @@ func runningPodWithSidecar(deploymentName string) string {
 	return podName
 }
 
-// mcList runs `mc ls` against the MinIO service using the persistent mc-client pod.
+// s3List runs `mc ls` against the S3 service using the persistent s3-client pod.
 // Returns the listing output on success, empty string on any error.
 // The mc alias is pre-configured in BeforeSuite so no setup is needed here.
-func mcList(path string) string {
-	out, err := kubectlQ("exec", "-n", testNamespace, "mc-client", "--",
+func s3List(path string) string {
+	out, err := kubectlQ("exec", "-n", testNamespace, "s3-client", "--",
 		"/bin/sh", "-c",
 		fmt.Sprintf("mc ls local/%s", path),
 	)
@@ -1528,12 +1528,12 @@ func dumpReplicationDiagnostics(appName, dbName, dbFile string) {
 	GinkgoWriter.Printf("--- ConfigMap %s-litestream ---\n%s\n", dbName, cm)
 
 	// 3. Full bucket listing (recursive, entire bucket).
-	allObjects, _ := kubectlQ("exec", "-n", testNamespace, "mc-client", "--",
-		"/bin/sh", "-c", "mc ls --recursive local/"+minioBucket+"/")
-	GinkgoWriter.Printf("--- mc ls --recursive local/%s/ ---\n%s\n", minioBucket, allObjects)
+	allObjects, _ := kubectlQ("exec", "-n", testNamespace, "s3-client", "--",
+		"/bin/sh", "-c", "mc ls --recursive local/"+s3Bucket+"/")
+	GinkgoWriter.Printf("--- mc ls --recursive local/%s/ ---\n%s\n", s3Bucket, allObjects)
 
 	// 4. mc alias verification.
-	aliasList, _ := kubectlQ("exec", "-n", testNamespace, "mc-client", "--",
+	aliasList, _ := kubectlQ("exec", "-n", testNamespace, "s3-client", "--",
 		"/bin/sh", "-c", "mc alias list local")
 	GinkgoWriter.Printf("--- mc alias list local ---\n%s\n", aliasList)
 

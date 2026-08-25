@@ -66,29 +66,6 @@ test: manifests generate setup-envtest ## Run tests. (go test runs go vet intern
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
 	  go test ./internal/... -coverprofile cover.out
 
-# TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
-# The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
-# CertManager is installed by default; skip with:
-# - CERT_MANAGER_INSTALL_SKIP=true
-KIND_CLUSTER ?= litestream-operator-test-e2e
-
-.PHONY: setup-test-e2e
-setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
-	@command -v $(KIND) >/dev/null 2>&1 || { \
-		echo "Kind is not installed. Please install Kind manually."; \
-		exit 1; \
-	}
-	$(_KIND_PROVIDER_ENV) $(KIND) create cluster --name $(KIND_CLUSTER)
-
-.PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	$(_KIND_PROVIDER_ENV) KIND_CLUSTER=$(KIND_CLUSTER) IMG=$(IMG) go test ./test/e2e/ -v -ginkgo.v
-	$(MAKE) cleanup-test-e2e
-
-.PHONY: cleanup-test-e2e
-cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
-	@$(_KIND_PROVIDER_ENV) $(KIND) delete cluster --name $(KIND_CLUSTER)
-
 ##@ Integration Tests
 # Usage:
 #   make kind-test-integration            — full CI cycle (create, test, destroy)
@@ -152,7 +129,7 @@ test-integration-setup: docker-build ## Create Kind cluster (with Podman support
 	@for img in \
 	  litestream/litestream:0.5.14 \
 	  keinos/sqlite3:latest \
-	  quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z \
+	  dxflrs/garage:v1.1.0 \
 	  quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z; do \
 	    echo "    pulling $$img"; \
 	    $(CONTAINER_TOOL) pull $$img; \
@@ -190,7 +167,7 @@ test-integration-redeploy: docker-build ## Rebuild image, reload into existing c
 	@for img in \
 	  litestream/litestream:0.5.14 \
 	  keinos/sqlite3:latest \
-	  quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z \
+	  dxflrs/garage:v1.1.0 \
 	  quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z; do \
 	    echo "    $$img"; \
 	    $(CONTAINER_TOOL) pull $$img 2>/dev/null || true; \

@@ -1,19 +1,22 @@
-name: E2E Tests
+name: Integration Tests
 
 on:
   push:
-    branches: [ main ]
-    tags: [ 'v*' ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
   workflow_dispatch:
 
 jobs:
-  test-e2e:
-    name: Run on Ubuntu
+  test-integration:
+    name: Integration Tests
     runs-on: ubuntu-latest
     steps:
-      - name: Clone the code
+      - name: Checkout code
         uses: actions/checkout@v7
 
       - name: Setup Go
@@ -21,16 +24,16 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install the latest version of kind
+      - name: Install Kind
         run: |
           curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64
           chmod +x ./kind
           sudo mv ./kind /usr/local/bin/kind
 
-      - name: Verify kind installation
-        run: kind version
+      - name: Install Helm
+        uses: azure/setup-helm@v5
 
-      - name: Running Test e2e
+      - name: Run integration tests
         run: |
           go mod tidy
-          make test-e2e
+          make kind-test-integration
