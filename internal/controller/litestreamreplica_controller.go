@@ -200,6 +200,9 @@ func buildLitestreamConfigYAML(db *databasev1.LitestreamReplica) string {
 			// MinIO and other S3-compatible stores require path-style addressing.
 			cfg += "      force-path-style: true\n"
 		}
+		if s3.Region != "" {
+			cfg += fmt.Sprintf("      region: %s\n", s3.Region)
+		}
 		cfg += fmt.Sprintf("      bucket: %s\n", s3.Bucket)
 		if s3.Path != "" {
 			// Litestream 0.5.x appends "/L{N}/" to the configured path when

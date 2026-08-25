@@ -66,29 +66,6 @@ test: manifests generate setup-envtest ## Run tests. (go test runs go vet intern
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
 	  go test ./internal/... -coverprofile cover.out
 
-# TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
-# The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
-# CertManager is installed by default; skip with:
-# - CERT_MANAGER_INSTALL_SKIP=true
-KIND_CLUSTER ?= litestream-operator-test-e2e
-
-.PHONY: setup-test-e2e
-setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
-	@command -v $(KIND) >/dev/null 2>&1 || { \
-		echo "Kind is not installed. Please install Kind manually."; \
-		exit 1; \
-	}
-	$(_KIND_PROVIDER_ENV) $(KIND) create cluster --name $(KIND_CLUSTER)
-
-.PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	$(_KIND_PROVIDER_ENV) KIND_CLUSTER=$(KIND_CLUSTER) IMG=$(IMG) go test ./test/e2e/ -v -ginkgo.v
-	$(MAKE) cleanup-test-e2e
-
-.PHONY: cleanup-test-e2e
-cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
-	@$(_KIND_PROVIDER_ENV) $(KIND) delete cluster --name $(KIND_CLUSTER)
-
 ##@ Integration Tests
 # Usage:
 #   make kind-test-integration            — full CI cycle (create, test, destroy)
@@ -102,7 +79,7 @@ cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 #   INTEGRATION_SKIP_CLUSTER_CREATE=true  skip 'kind create' (use existing cluster)
 #   INTEGRATION_KEEP_NAMESPACE=true       leave test namespace after run (for debugging)
 #
-# External S3 backend (optional — skips in-cluster MinIO when set):
+# External S3 backend (optional — skips in-cluster Garage when set):
 #   S3_ENDPOINT    S3-compatible endpoint (e.g. https://garage.internal.keener.us)
 #   S3_ACCESS_KEY  access key ID
 #   S3_SECRET_KEY  secret access key
@@ -164,11 +141,11 @@ test-integration-setup: docker-build ## Create Kind cluster (with Podman support
 	    $(_KIND_PROVIDER_ENV) $(KIND) load docker-image $$img --name $(INTEGRATION_KIND_CLUSTER); \
 	done
 	@if [ -z "$(S3_ENDPOINT)" ]; then \
-	    echo "    pulling quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z"; \
-	    $(CONTAINER_TOOL) pull quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z; \
-	    $(_KIND_PROVIDER_ENV) $(KIND) load docker-image quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z --name $(INTEGRATION_KIND_CLUSTER); \
+	    echo "    pulling dxflrs/garage:v1.1.0"; \
+	    $(CONTAINER_TOOL) pull dxflrs/garage:v1.1.0; \
+	    $(_KIND_PROVIDER_ENV) $(KIND) load docker-image dxflrs/garage:v1.1.0 --name $(INTEGRATION_KIND_CLUSTER); \
 	else \
-	    echo "    (skipping MinIO server image — using external S3)"; \
+	    echo "    (skipping Garage image — using external S3)"; \
 	fi
 
 	@echo "==> Installing cert-manager $(CERT_MANAGER_VERSION)"
@@ -212,9 +189,9 @@ test-integration-redeploy: docker-build ## Rebuild image, reload into existing c
 	    $(_KIND_PROVIDER_ENV) $(KIND) load docker-image $$img --name $(INTEGRATION_KIND_CLUSTER); \
 	done
 	@if [ -z "$(S3_ENDPOINT)" ]; then \
-	    echo "    quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z"; \
-	    $(CONTAINER_TOOL) pull quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z 2>/dev/null || true; \
-	    $(_KIND_PROVIDER_ENV) $(KIND) load docker-image quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z --name $(INTEGRATION_KIND_CLUSTER); \
+	    echo "    dxflrs/garage:v1.1.0"; \
+	    $(CONTAINER_TOOL) pull dxflrs/garage:v1.1.0 2>/dev/null || true; \
+	    $(_KIND_PROVIDER_ENV) $(KIND) load docker-image dxflrs/garage:v1.1.0 --name $(INTEGRATION_KIND_CLUSTER); \
 	fi
 	@echo "==> Restarting operator"
 	KUBECONFIG=$(INTEGRATION_KUBECONFIG) kubectl rollout restart \

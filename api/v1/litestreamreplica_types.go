@@ -34,6 +34,12 @@ type S3Destination struct {
 	// Path is the key prefix within the bucket (e.g. "paperless/").
 	Path string `json:"path,omitempty"`
 
+	// Region is the S3 region used for request signing.
+	// Required for S3-compatible backends that enforce a specific signing region
+	// (e.g. Garage uses "garage"). Defaults to the Litestream default ("us-east-1")
+	// when omitted.
+	Region string `json:"region,omitempty"`
+
 	// SecretRef names a Secret in the same namespace containing S3 credentials.
 	// The Secret must have keys: ACCESS_KEY_ID, SECRET_ACCESS_KEY.
 	// +kubebuilder:validation:Required

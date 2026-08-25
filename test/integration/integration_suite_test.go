@@ -42,6 +42,7 @@ var (
 	s3SecretKey   string
 	s3Bucket      string
 	s3Endpoint    string // what Litestream pods use (in-cluster DNS or external hostname)
+	s3Region      string // S3 signing region (e.g. "garage" for Garage)
 	mcEndpoint    string // scheme-qualified URL for configuring the mc alias
 )
 
@@ -67,56 +68,86 @@ var _ = BeforeSuite(func() {
 			s3Bucket = defaultBucket
 		}
 
-		// Auto-detect scheme for mc alias URL.
 		if strings.HasPrefix(ep, "https://") || strings.HasPrefix(ep, "http://") {
 			mcEndpoint = ep
-			// Litestream s3Endpoint: the controller handles scheme detection,
-			// so pass through as-is (with scheme).
 			s3Endpoint = ep
 		} else {
 			mcEndpoint = "http://" + ep
 			s3Endpoint = ep
 		}
+		s3Region = os.Getenv("S3_REGION")
 		_, _ = fmt.Fprintf(GinkgoWriter, "Using external S3 backend: %s (bucket: %s)\n", s3Endpoint, s3Bucket)
 	} else {
-		s3AccessKey = "minioadmin"
-		s3SecretKey = "minioadmin"
 		s3Bucket = defaultBucket
-		s3Endpoint = "minio." + testNamespace + ".svc.cluster.local:9000"
-		mcEndpoint = "http://minio:9000"
-		_, _ = fmt.Fprintf(GinkgoWriter, "Using in-cluster MinIO (bucket: %s)\n", s3Bucket)
+		s3Endpoint = "garage." + testNamespace + ".svc.cluster.local:3900"
+		s3Region = "garage"
+		mcEndpoint = "http://garage:3900"
+		_, _ = fmt.Fprintf(GinkgoWriter, "Using in-cluster Garage (bucket: %s)\n", s3Bucket)
 	}
 
 	By("creating test namespace")
 	runIgnoreError("kubectl", "create", "namespace", testNamespace)
 
 	if !useExternalS3 {
-		By("deploying MinIO in test namespace")
-		applyLiteral(minioManifest())
+		By("deploying Garage in test namespace")
+		applyLiteral(garageManifest())
 
-		By("waiting for MinIO pod to be Running")
-		kubectl("wait", "-n", testNamespace, "deployment/minio",
+		By("waiting for Garage deployment to be Available")
+		kubectl("wait", "-n", testNamespace, "deployment/garage",
 			"--for=condition=Available", "--timeout=3m")
 
-		By("creating MinIO bucket via mc Job")
-		applyLiteral(createBucketJobManifest())
-		kubectl("wait", "-n", testNamespace, "job/minio-create-bucket",
-			"--for=condition=Complete", "--timeout=2m")
+		garagePod := strings.TrimSpace(kubectl("get", "pods", "-n", testNamespace,
+			"-l", "app=garage", "-o", "jsonpath={.items[0].metadata.name}"))
+		kubectl("wait", "-n", testNamespace, "pod/"+garagePod,
+			"--for=condition=Ready", "--timeout=2m")
+
+		By("configuring Garage layout")
+		nodeIDOut := kubectl("exec", "-n", testNamespace, garagePod, "--",
+			"/garage", "node", "id")
+		var nodeID string
+		for _, line := range strings.Split(nodeIDOut, "\n") {
+			line = strings.TrimSpace(line)
+			if idx := strings.Index(line, "@"); idx > 0 {
+				parts := strings.Fields(line[:idx])
+				nodeID = parts[len(parts)-1]
+				break
+			}
+		}
+		Expect(nodeID).NotTo(BeEmpty(), "failed to parse node ID from:\n%s", nodeIDOut)
+		kubectl("exec", "-n", testNamespace, garagePod, "--",
+			"/garage", "layout", "assign", "-z", "dc1", "-c", "1G", nodeID)
+		kubectl("exec", "-n", testNamespace, garagePod, "--",
+			"/garage", "layout", "apply", "--version", "1")
+
+		By("creating S3 bucket in Garage")
+		kubectl("exec", "-n", testNamespace, garagePod, "--",
+			"/garage", "bucket", "create", s3Bucket)
+
+		By("creating API key in Garage")
+		keyOutput := kubectl("exec", "-n", testNamespace, garagePod, "--",
+			"/garage", "key", "create", "testkey")
+		s3AccessKey, s3SecretKey = parseGarageKeyOutput(keyOutput)
+		GinkgoWriter.Printf("Garage key created: access=%s\n", s3AccessKey)
+
+		By("granting bucket permissions to API key")
+		kubectl("exec", "-n", testNamespace, garagePod, "--",
+			"/garage", "bucket", "allow", "--read", "--write", "--owner",
+			s3Bucket, "--key", "testkey")
 	}
 
 	By("creating S3 credentials Secret")
-	runIgnoreError("kubectl", "delete", "secret", "minio-creds", "-n", testNamespace, "--ignore-not-found")
-	kubectl("create", "secret", "generic", "minio-creds",
+	runIgnoreError("kubectl", "delete", "secret", "s3-creds", "-n", testNamespace, "--ignore-not-found")
+	kubectl("create", "secret", "generic", "s3-creds",
 		"-n", testNamespace,
 		"--from-literal=ACCESS_KEY_ID="+s3AccessKey,
 		"--from-literal=SECRET_ACCESS_KEY="+s3SecretKey,
 	)
 
-	By("starting persistent mc client pod")
-	applyLiteral(mcClientPodManifest())
-	kubectl("wait", "-n", testNamespace, "pod/mc-client",
+	By("starting persistent S3 client pod")
+	applyLiteral(s3ClientPodManifest())
+	kubectl("wait", "-n", testNamespace, "pod/s3-client",
 		"--for=condition=Ready", "--timeout=2m")
-	kubectl("exec", "-n", testNamespace, "mc-client", "--",
+	kubectl("exec", "-n", testNamespace, "s3-client", "--",
 		"/bin/sh", "-c",
 		fmt.Sprintf("mc alias set local %s %s %s > /dev/null 2>&1", mcEndpoint, s3AccessKey, s3SecretKey),
 	)
@@ -183,77 +214,125 @@ func applyLiteralQ(yaml string) (string, error) {
 	return kubectlQ("apply", "-f", f.Name())
 }
 
+// parseGarageKeyOutput extracts the access key ID and secret key from
+// `garage key create` output.
+func parseGarageKeyOutput(output string) (accessKey, secretKey string) {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Key ID:") {
+			accessKey = strings.TrimSpace(strings.TrimPrefix(line, "Key ID:"))
+		}
+		if strings.HasPrefix(line, "Secret key:") {
+			secretKey = strings.TrimSpace(strings.TrimPrefix(line, "Secret key:"))
+		}
+	}
+	Expect(accessKey).NotTo(BeEmpty(), "failed to parse Key ID from garage key create output:\n%s", output)
+	Expect(secretKey).NotTo(BeEmpty(), "failed to parse Secret key from garage key create output:\n%s", output)
+	return
+}
+
 // ── static manifests ───────────────────────────────────────────────────────
 
-func minioManifest() string {
+func garageManifest() string {
 	return fmt.Sprintf(`
 apiVersion: v1
-kind: PersistentVolumeClaim
+kind: ConfigMap
 metadata:
-  name: minio-data
-  namespace: %s
-spec:
-  accessModes: [ReadWriteOnce]
-  resources:
-    requests:
-      storage: 2Gi
+  name: garage-config
+  namespace: %[1]s
+data:
+  garage.toml: |
+    metadata_dir = "/var/lib/garage/meta"
+    data_dir = "/var/lib/garage/data"
+    db_engine = "lmdb"
+    replication_factor = 1
+    rpc_bind_addr = "0.0.0.0:3901"
+
+    [s3_api]
+    s3_region = "garage"
+    api_bind_addr = "0.0.0.0:3900"
+    root_domain = ".s3.garage.localhost"
+
+    [s3_web]
+    bind_addr = "0.0.0.0:3902"
+    root_domain = ".web.garage.localhost"
+
+    [admin]
+    api_bind_addr = "0.0.0.0:3903"
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: minio
-  namespace: %s
+  name: garage
+  namespace: %[1]s
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: minio
+      app: garage
   template:
     metadata:
       labels:
-        app: minio
+        app: garage
     spec:
       containers:
-        - name: minio
-          image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
-          args: ["server", "/data", "--console-address", ":9001"]
+        - name: garage
+          image: dxflrs/garage:v1.1.0
           env:
-            - name: MINIO_ROOT_USER
-              value: "%s"
-            - name: MINIO_ROOT_PASSWORD
-              value: "%s"
+            - name: GARAGE_RPC_SECRET
+              value: "%[2]s"
           ports:
-            - containerPort: 9000
-            - containerPort: 9001
+            - containerPort: 3900
+              name: s3
+            - containerPort: 3901
+              name: rpc
+            - containerPort: 3903
+              name: admin
+          readinessProbe:
+            tcpSocket:
+              port: 3900
+            initialDelaySeconds: 2
+            periodSeconds: 3
           volumeMounts:
+            - name: config
+              mountPath: /etc/garage.toml
+              subPath: garage.toml
             - name: data
-              mountPath: /data
+              mountPath: /var/lib/garage
       volumes:
+        - name: config
+          configMap:
+            name: garage-config
         - name: data
-          persistentVolumeClaim:
-            claimName: minio-data
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: minio
-  namespace: %s
+  name: garage
+  namespace: %[1]s
 spec:
   selector:
-    app: minio
+    app: garage
   ports:
-    - name: api
-      port: 9000
-      targetPort: 9000
-`, testNamespace, testNamespace, s3AccessKey, s3SecretKey, testNamespace)
+    - name: s3
+      port: 3900
+      targetPort: 3900
+    - name: rpc
+      port: 3901
+      targetPort: 3901
+    - name: admin
+      port: 3903
+      targetPort: 3903
+`, testNamespace, strings.Repeat("ab", 32))
 }
 
-func mcClientPodManifest() string {
+func s3ClientPodManifest() string {
 	return fmt.Sprintf(`
 apiVersion: v1
 kind: Pod
 metadata:
-  name: mc-client
+  name: s3-client
   namespace: %s
 spec:
   restartPolicy: Never
@@ -262,29 +341,4 @@ spec:
       image: quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z
       command: ["sleep", "infinity"]
 `, testNamespace)
-}
-
-func createBucketJobManifest() string {
-	return fmt.Sprintf(`
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: minio-create-bucket
-  namespace: %s
-spec:
-  backoffLimit: 3
-  template:
-    spec:
-      restartPolicy: OnFailure
-      containers:
-        - name: mc
-          image: quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z
-          command:
-            - /bin/sh
-            - -c
-            - |
-              mc alias set local http://minio:9000 %s %s
-              mc mb --ignore-existing local/%s
-              echo "Bucket %s ready"
-`, testNamespace, s3AccessKey, s3SecretKey, s3Bucket, s3Bucket)
 }
