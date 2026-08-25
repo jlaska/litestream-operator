@@ -105,7 +105,8 @@ var _ = BeforeSuite(func() {
 		for _, line := range strings.Split(nodeIDOut, "\n") {
 			line = strings.TrimSpace(line)
 			if idx := strings.Index(line, "@"); idx > 0 {
-				nodeID = line[:idx]
+				parts := strings.Fields(line[:idx])
+				nodeID = parts[len(parts)-1]
 				break
 			}
 		}
