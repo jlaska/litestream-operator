@@ -242,6 +242,7 @@ data:
     data_dir = "/var/lib/garage/data"
     db_engine = "lmdb"
     replication_factor = 1
+    rpc_bind_addr = "0.0.0.0:3901"
 
     [s3_api]
     s3_region = "garage"
@@ -251,10 +252,6 @@ data:
     [s3_web]
     bind_addr = "0.0.0.0:3902"
     root_domain = ".web.garage.localhost"
-
-    [rpc]
-    bind_addr = "0.0.0.0:3901"
-    secret = "0000000000000000000000000000000000000000000000000000000000000000"
 
     [admin]
     api_bind_addr = "0.0.0.0:3903"
@@ -277,6 +274,9 @@ spec:
       containers:
         - name: garage
           image: dxflrs/garage:v1.1.0
+          env:
+            - name: GARAGE_RPC_SECRET
+              value: "%[2]s"
           ports:
             - containerPort: 3900
               name: s3
@@ -320,7 +320,7 @@ spec:
     - name: admin
       port: 3903
       targetPort: 3903
-`, testNamespace)
+`, testNamespace, strings.Repeat("ab", 32))
 }
 
 func s3ClientPodManifest() string {
