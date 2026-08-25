@@ -42,6 +42,7 @@ var (
 	s3SecretKey   string
 	s3Bucket      string
 	s3Endpoint    string // what Litestream pods use (in-cluster DNS or external hostname)
+	s3Region      string // S3 signing region (e.g. "garage" for Garage)
 	mcEndpoint    string // scheme-qualified URL for configuring the mc alias
 )
 
@@ -74,10 +75,12 @@ var _ = BeforeSuite(func() {
 			mcEndpoint = "http://" + ep
 			s3Endpoint = ep
 		}
+		s3Region = os.Getenv("S3_REGION")
 		_, _ = fmt.Fprintf(GinkgoWriter, "Using external S3 backend: %s (bucket: %s)\n", s3Endpoint, s3Bucket)
 	} else {
 		s3Bucket = defaultBucket
 		s3Endpoint = "garage." + testNamespace + ".svc.cluster.local:3900"
+		s3Region = "garage"
 		mcEndpoint = "http://garage:3900"
 		_, _ = fmt.Fprintf(GinkgoWriter, "Using in-cluster Garage (bucket: %s)\n", s3Bucket)
 	}

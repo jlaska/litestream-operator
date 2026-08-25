@@ -79,6 +79,13 @@ spec:
                             description: Path is the key prefix within the bucket
                               (e.g. "paperless/").
                             type: string
+                          region:
+                            description: |-
+                              Region is the S3 region used for request signing.
+                              Required for S3-compatible backends that enforce a specific signing region
+                              (e.g. Garage uses "garage"). Defaults to the Litestream default ("us-east-1")
+                              when omitted.
+                            type: string
                           secretRef:
                             description: |-
                               SecretRef names a Secret in the same namespace containing S3 credentials.
