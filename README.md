@@ -9,7 +9,10 @@
 
 > **Continuous S3 backup for SQLite databases running in Kubernetes** — no application changes required.
 
-litestream-operator injects a [Litestream](https://litestream.io) sidecar into your existing application pods, streaming WAL changes to any S3-compatible object store (Garage, AWS S3, Backblaze B2, ...) in real time. Declare a `LitestreamReplica` resource, point it at your app's Deployment, and get point-in-time-recoverable database backups without touching your application code.
+litestream-operator injects a [Litestream](https://litestream.io) sidecar into your existing application pods,
+streaming WAL changes to any S3-compatible object store (Garage, AWS S3, Backblaze B2, ...) in real time.
+Declare a `LitestreamReplica` resource, point it at your app's Deployment,
+and get point-in-time-recoverable database backups without touching your application code.
 
 ---
 
