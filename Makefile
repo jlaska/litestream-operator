@@ -80,6 +80,52 @@ test: manifests generate setup-envtest ## Run tests. (go test runs go vet intern
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
 	  go test ./internal/... -coverprofile cover.out
 
+##@ Verification
+
+.PHONY: verify-generate
+verify-generate: generate ## Verify generated Go code (DeepCopy) is up to date.
+	@if ! git diff --quiet -- api/ internal/; then \
+		echo "ERROR: Generated Go code is out of date. Run 'make generate' and commit the result."; \
+		git diff --stat -- api/ internal/; \
+		exit 1; \
+	fi
+
+.PHONY: verify-manifests
+verify-manifests: manifests ## Verify CRD, RBAC, and webhook manifests are up to date.
+	@if ! git diff --quiet -- config/ charts/litestream-operator/crds/; then \
+		echo "ERROR: Generated manifests are out of date. Run 'make manifests' and commit the result."; \
+		git diff --stat -- config/ charts/litestream-operator/crds/; \
+		exit 1; \
+	fi
+
+.PHONY: verify-generated
+verify-generated: ## Verify all generated artifacts (Go code + manifests) are up to date.
+	$(MAKE) generate
+	$(MAKE) manifests
+	@if ! git diff --quiet -- api/ internal/ config/ charts/litestream-operator/crds/; then \
+		echo "ERROR: Generated artifacts are out of date. Run 'make generate manifests' and commit the result."; \
+		git diff --stat -- api/ internal/ config/ charts/litestream-operator/crds/; \
+		exit 1; \
+	fi
+
+.PHONY: verify-kustomize
+verify-kustomize: kustomize ## Verify Kustomize overlays render successfully.
+	@echo "Verifying kustomize build: config/default"
+	@$(KUSTOMIZE) build config/default > /dev/null
+	@echo "Verifying kustomize build: config/crd"
+	@$(KUSTOMIZE) build config/crd > /dev/null
+	@echo "Verifying kustomize build: config/manager"
+	@$(KUSTOMIZE) build config/manager > /dev/null
+	@echo "Verifying kustomize build: config/rbac"
+	@$(KUSTOMIZE) build config/rbac > /dev/null
+	@echo "✓ All kustomize overlays render successfully"
+
+.PHONY: verify-helm
+verify-helm: ## Verify Helm chart lints and renders successfully.
+	helm lint charts/litestream-operator
+	@helm template test charts/litestream-operator > /dev/null
+	@echo "✓ Helm chart lints and renders successfully"
+
 ##@ Integration Tests
 # Usage:
 #   make kind-test-integration            — full CI cycle (create, test, destroy)
