@@ -9,7 +9,27 @@
 
 > **Continuous S3 backup for SQLite databases running in Kubernetes** — no application changes required.
 
-litestream-operator injects a [Litestream](https://litestream.io) sidecar into your existing application pods, streaming WAL changes to any S3-compatible object store (MinIO, AWS S3, Backblaze B2, ...) in real time. Declare a `LitestreamReplica` resource, point it at your app's Deployment, and get point-in-time-recoverable database backups without touching your application code.
+litestream-operator injects a [Litestream](https://litestream.io) sidecar into your existing application pods, streaming WAL changes to any S3-compatible object store (Garage, AWS S3, Backblaze B2, ...) in real time. Declare a `LitestreamReplica` resource, point it at your app's Deployment, and get point-in-time-recoverable database backups without touching your application code.
+
+---
+
+## Table of Contents
+
+- [Quick start](#quick-start)
+- [How it works](#how-it-works)
+- [CRD reference](#crd-reference)
+  - [LitestreamReplica](#litestreamreplica)
+  - [LitestreamRestore](#litestreamrestore)
+- [Recovery modes](#recovery-modes)
+- [Production checklist](#production-checklist)
+- [Usage examples](#usage-examples)
+- [Annotations](#annotations)
+- [Kubernetes events](#kubernetes-events)
+- [Prometheus metrics](#prometheus-metrics)
+- [Troubleshooting](#troubleshooting)
+- [Helm chart values](#helm-chart-values)
+- [Development](#development)
+- [License](#license)
 
 ---
 
@@ -19,7 +39,6 @@ litestream-operator injects a [Litestream](https://litestream.io) sidecar into y
 
 ```bash
 helm install litestream-operator oci://ghcr.io/jlaska/charts/litestream-operator \
-  --version 0.4.1 \
   --namespace litestream-operator-system \
   --create-namespace
 ```
@@ -29,7 +48,6 @@ helm install litestream-operator oci://ghcr.io/jlaska/charts/litestream-operator
 > To skip cert-manager (bring your own webhook TLS secret):
 > ```bash
 > helm install litestream-operator oci://ghcr.io/jlaska/charts/litestream-operator \
->   --version 0.4.1 \
 >   --namespace litestream-operator-system \
 >   --create-namespace \
 >   --set certManager.enabled=false \
@@ -39,11 +57,13 @@ helm install litestream-operator oci://ghcr.io/jlaska/charts/litestream-operator
 ### 2. Create an S3 credentials Secret
 
 ```bash
-kubectl create secret generic minio-creds \
+kubectl create secret generic s3-credential \
   --from-literal=ACCESS_KEY_ID=<your-access-key> \
   --from-literal=SECRET_ACCESS_KEY=<your-secret-key> \
-  --namespace my-app
+  --namespace example
 ```
+
+> **Note**: The Secret must be in the same namespace as the `LitestreamReplica` resource (and the target workload).
 
 ### 3. Declare a LitestreamReplica resource
 
@@ -51,12 +71,12 @@ kubectl create secret generic minio-creds \
 apiVersion: litestream.io/v1
 kind: LitestreamReplica
 metadata:
-  name: paperless-db
-  namespace: paperless
+  name: my-app-db
+  namespace: example
 spec:
-  targetDeployment: paperless-webserver
-  databasePath: /usr/src/paperless/data
-  databaseName: paperless.db
+  targetDeployment: my-app
+  databasePath: /data
+  databaseName: app.db
 
   # Recovery mode: Manual (default) blocks startup if local DB missing but
   # archive exists; Automatic uses Litestream's native restore flags.
@@ -67,10 +87,10 @@ spec:
     enabled: true
     destination:
       s3:
-        endpoint: minio.homelab:9000     # omit for AWS S3
+        endpoint: s3.example.com:9000    # omit for AWS S3
         bucket: litestream-backups
-        path: paperless/
-        secretRef: minio-creds
+        path: my-app/
+        secretRef: s3-credential
     retention:
       duration: "720h"              # 30 days
 
@@ -82,20 +102,20 @@ spec:
 Apply it:
 
 ```bash
-kubectl apply -f paperless-db.yaml
+kubectl apply -f litestreamreplica.yaml
 ```
 
-The operator annotates `paperless-webserver`, which triggers a rolling update. New pods get the Litestream sidecar injected automatically — no Deployment changes required.
+The operator annotates `my-app`, which triggers a rolling update. New pods get the Litestream sidecar injected automatically — no Deployment changes required.
 
 ### 4. Verify
 
 ```bash
 # Check injection and backup health
-kubectl get litestreamreplica paperless-db -n paperless
-# NAME           TARGET                DATABASE       BACKUP  PHASE  READY  AGE
-# paperless-db   paperless-webserver   paperless.db   true    Ready  true   3d
+kubectl get litestreamreplica my-app-db -n example
+# NAME        TARGET   DATABASE   BACKUP  PHASE  READY  AGE
+# my-app-db   my-app   app.db     true    Ready  true   3d
 
-kubectl describe litestreamreplica paperless-db -n paperless
+kubectl describe litestreamreplica my-app-db -n example
 # Conditions:
 #   TargetReady          True   DeploymentFound
 #   SidecarReady         True   SidecarRunning
@@ -118,7 +138,7 @@ litestream-operator is to SQLite what [CloudNativePG](https://cloudnative-pg.io)
 │  │   app       │ │  litestream   │  │
 │  │  container  │ │   sidecar     │  │
 │  │             │ │               │  │
-│  │  reads/     │ │  streams WAL  │──┼──► S3 / MinIO
+│  │  reads/     │ │  streams WAL  │──┼──► S3
 │  │  writes     │ │  changes      │  │
 │  │  /data/     │ │  continuously │  │
 │  │  app.db     │ │               │  │
@@ -197,7 +217,7 @@ litestream-operator is to SQLite what [CloudNativePG](https://cloudnative-pg.io)
 ```bash
 kubectl get litestreamreplica -A
 # NAMESPACE    NAME          TARGET         DATABASE   BACKUP  PHASE  READY  AGE
-# paperless    paperless-db  paperless-web  app.db     true    Ready  true   3d
+# example    my-app-db  my-app  app.db     true    Ready  true   3d
 ```
 
 ### LitestreamRestore
@@ -210,11 +230,11 @@ Trigger a restore from any `LitestreamReplica` backup. Two modes:
 apiVersion: litestream.io/v1
 kind: LitestreamRestore
 metadata:
-  name: paperless-restore
-  namespace: paperless
+  name: my-app-restore
+  namespace: example
 spec:
   sourceRef:
-    name: paperless-db
+    name: my-app-db
   mode: InPlace
   timestamp: "2026-06-17T10:00:00Z"  # optional: point-in-time recovery
 ```
@@ -225,15 +245,15 @@ spec:
 apiVersion: litestream.io/v1
 kind: LitestreamRestore
 metadata:
-  name: paperless-clone
-  namespace: paperless
+  name: my-app-clone
+  namespace: example
 spec:
   sourceRef:
-    name: paperless-db
+    name: my-app-db
   mode: ToPVC
   target:
-    pvc: paperless-restore
-    path: /data/paperless.db
+    pvc: my-app-restore
+    path: /data/app.db
 ```
 
 | Field | Type | Required | Description |
@@ -262,9 +282,9 @@ spec:
 Monitor progress:
 
 ```bash
-kubectl get litestreamrestore paperless-restore -n paperless
+kubectl get litestreamrestore my-app-restore -n example
 # NAME                SOURCE         MODE      PHASE      AGE
-# paperless-restore   paperless-db   InPlace   Completed  2m
+# my-app-restore   my-app-db   InPlace   Completed  2m
 ```
 
 ---
@@ -488,7 +508,7 @@ strategy:
 ## Helm chart values
 
 ```bash
-helm show values oci://ghcr.io/jlaska/charts/litestream-operator --version 0.4.1
+helm show values oci://ghcr.io/jlaska/charts/litestream-operator
 ```
 
 Key values:
