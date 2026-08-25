@@ -31,7 +31,7 @@ jobs:
           sudo mv ./kind /usr/local/bin/kind
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
 
       - name: Run integration tests
         run: make kind-test-integration
