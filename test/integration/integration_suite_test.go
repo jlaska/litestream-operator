@@ -95,6 +95,8 @@ var _ = BeforeSuite(func() {
 
 		garagePod := strings.TrimSpace(kubectl("get", "pods", "-n", testNamespace,
 			"-l", "app=garage", "-o", "jsonpath={.items[0].metadata.name}"))
+		kubectl("wait", "-n", testNamespace, "pod/"+garagePod,
+			"--for=condition=Ready", "--timeout=2m")
 
 		By("configuring Garage layout")
 		nodeIDOut := kubectl("exec", "-n", testNamespace, garagePod, "--",
@@ -282,6 +284,11 @@ spec:
               name: rpc
             - containerPort: 3903
               name: admin
+          readinessProbe:
+            tcpSocket:
+              port: 3900
+            initialDelaySeconds: 2
+            periodSeconds: 3
           volumeMounts:
             - name: config
               mountPath: /etc/garage.toml
