@@ -42,6 +42,20 @@ all: help
 help: ## Display this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
+##@ Setup
+
+.PHONY: setup
+setup: ## Install pre-commit hooks and development dependencies.
+	@command -v pre-commit >/dev/null 2>&1 || { echo "Error: pre-commit not found. Install with: brew install pre-commit (or pip install pre-commit)"; exit 1; }
+	pre-commit install
+	pre-commit install --hook-type commit-msg
+	@echo ""
+	@echo "✓ Pre-commit hooks installed. Run 'pre-commit run --all-files' to check the entire repo."
+
+.PHONY: pre-commit
+pre-commit: ## Run all pre-commit hooks against all files.
+	pre-commit run --all-files
+
 ##@ Development
 
 .PHONY: manifests

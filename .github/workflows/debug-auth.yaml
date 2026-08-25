@@ -22,10 +22,10 @@ jobs:
       run: |
         echo "Testing docker login status..."
         docker system info | grep -E "(Username|Registry)"
-        
+
         echo "Testing repository access..."
         docker pull alpine:latest
         docker tag alpine:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:test-auth
-        
+
         echo "Testing push permissions..."
         docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:test-auth || echo "Push failed - checking specific error"

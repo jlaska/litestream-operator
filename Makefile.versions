@@ -10,7 +10,7 @@ ORG ?= jlaska
 IMAGE_NAME ?= litestream-operator
 IMG ?= $(REGISTRY)/$(ORG)/$(IMAGE_NAME):$(VERSION)
 
-# Kubernetes settings  
+# Kubernetes settings
 NAMESPACE ?= litestream-operator-system
 KUBECONFIG ?= ~/.kube/config
 
@@ -38,7 +38,7 @@ version-bump-patch: ## Bump patch version (v1.2.3 -> v1.2.4)
 	@sed -i.bak 's/VERSION ?= $(VERSION)/VERSION ?= $(NEW_VERSION)/' Makefile.versions
 	@rm -f Makefile.versions.bak
 
-.PHONY: version-bump-minor  
+.PHONY: version-bump-minor
 version-bump-minor: ## Bump minor version (v1.2.3 -> v1.3.0)
 	$(eval NEW_VERSION := $(shell echo $(VERSION) | sed 's/v//' | awk -F. '{$$2=$$2+1; $$3=0; print "v"$$1"."$$2"."$$3}'))
 	@echo "Bumping version from $(VERSION) to $(NEW_VERSION)"
@@ -46,7 +46,7 @@ version-bump-minor: ## Bump minor version (v1.2.3 -> v1.3.0)
 	@rm -f Makefile.versions.bak
 
 .PHONY: version-bump-major
-version-bump-major: ## Bump major version (v1.2.3 -> v2.0.0)  
+version-bump-major: ## Bump major version (v1.2.3 -> v2.0.0)
 	$(eval NEW_VERSION := $(shell echo $(VERSION) | sed 's/v//' | awk -F. '{$$1=$$1+1; $$2=0; $$3=0; print "v"$$1"."$$2"."$$3}'))
 	@echo "Bumping version from $(VERSION) to $(NEW_VERSION)"
 	@sed -i.bak 's/VERSION ?= $(VERSION)/VERSION ?= $(NEW_VERSION)/' Makefile.versions

@@ -1,0 +1,19 @@
+default: true
+
+# Allow long lines (common in README badges, URLs, tables)
+MD013:
+  line_length: 200
+  tables: false
+  code_blocks: false
+
+# Allow multiple top-level headings (common in changelogs)
+MD025: false
+
+# Allow inline HTML (badges, details/summary, etc.)
+MD033: false
+
+# Allow bare URLs
+MD034: false
+
+# Don't enforce table column style (compact separators like |---| are fine)
+MD060: false
