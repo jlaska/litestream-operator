@@ -14,6 +14,20 @@ repos:
       - id: check-case-conflict
       - id: mixed-line-ending
 
+  # Secrets detection (general)
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.3
+    hooks:
+      - id: gitleaks
+
+  # AWS credential detection
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: detect-aws-credentials
+        args: ['--allow-missing-credentials']
+      - id: detect-private-key
+
   # Go formatting and vetting
   - repo: https://github.com/tekwizely/pre-commit-golang
     rev: v1.0.0-rc.1
@@ -36,16 +50,39 @@ repos:
       - id: markdownlint
         args: ['--config', '.markdownlint.yaml']
 
-  # Secrets detection (general)
-  - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.24.3
+  # Shell validation
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
     hooks:
-      - id: gitleaks
+      - id: shellcheck
 
-  # AWS credential detection
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+  # Kubernetes operator verification (local hooks using Make targets)
+  - repo: local
     hooks:
-      - id: detect-aws-credentials
-        args: ['--allow-missing-credentials']
-      - id: detect-private-key
+      - id: verify-generated
+        name: Verify generated operator artifacts
+        entry: make verify-generated
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: verify-kustomize
+        name: Verify Kustomize overlays render
+        entry: make verify-kustomize
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: verify-helm
+        name: Verify Helm chart
+        entry: make verify-helm
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: test
+        name: Run tests
+        entry: make test
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]

@@ -19,6 +19,12 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Verify generated artifacts
+        run: make verify-generated
+
+      - name: Verify Kustomize overlays
+        run: make verify-kustomize
+
       - name: Running Tests
         run: |
           go mod tidy
