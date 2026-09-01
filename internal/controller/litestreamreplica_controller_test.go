@@ -567,6 +567,30 @@ var _ = Describe("buildLitestreamConfig", func() {
 		cfg := reconciler.buildLitestreamConfig(db)
 		Expect(cfg).NotTo(ContainSubstring("sync-interval"))
 	})
+
+	It("includes auto-recover when AutoRecover is true", func() {
+		db := newDB("/data", "app.db", databasev1.BackupSpec{
+			Enabled: true,
+			Destination: databasev1.BackupDestination{
+				S3: &databasev1.S3Destination{Bucket: "b", SecretRef: "s"},
+			},
+			AutoRecover: true,
+		})
+		cfg := reconciler.buildLitestreamConfig(db)
+		Expect(cfg).To(ContainSubstring("auto-recover: true"))
+	})
+
+	It("omits auto-recover when AutoRecover is false", func() {
+		db := newDB("/data", "app.db", databasev1.BackupSpec{
+			Enabled: true,
+			Destination: databasev1.BackupDestination{
+				S3: &databasev1.S3Destination{Bucket: "b", SecretRef: "s"},
+			},
+			AutoRecover: false,
+		})
+		cfg := reconciler.buildLitestreamConfig(db)
+		Expect(cfg).NotTo(ContainSubstring("auto-recover"))
+	})
 })
 
 func createTestPod(ctx context.Context, name, namespace, appLabel string) *corev1.Pod {
@@ -584,13 +608,7 @@ func patchContainerStatuses(ctx context.Context, pod *corev1.Pod, statuses []cor
 	Expect(k8sClient.Status().Patch(ctx, pod, patch)).To(Succeed())
 }
 
-func patchInitContainerStatuses(ctx context.Context, pod *corev1.Pod, statuses []corev1.ContainerStatus) {
-	patch := client.MergeFrom(pod.DeepCopy())
-	pod.Status.InitContainerStatuses = statuses
-	Expect(k8sClient.Status().Patch(ctx, pod, patch)).To(Succeed())
-}
-
-var _ = Describe("litestreamContainerState and archiveCheckState", func() {
+var _ = Describe("litestreamContainerState", func() {
 	// These tests use envtest to create Pods with manually-patched container statuses.
 	const (
 		lsTestNamespace = "default"
@@ -706,107 +724,6 @@ var _ = Describe("litestreamContainerState and archiveCheckState", func() {
 		})
 	})
 
-	Describe("clearSkipArchiveCheck", func() {
-		It("clears skip-archive-check annotation when sidecar is healthy", func() {
-			// Simulate the post-restore state: skip-archive-check is set on the
-			// LitestreamReplica (placed there by the restore controller) and a healthy
-			// sidecar pod is present (meaning litestream has started and created the state dir).
-			Eventually(func() error {
-				db := &databasev1.LitestreamReplica{}
-				if err := k8sClient.Get(ctx, types.NamespacedName{Name: lsDBName, Namespace: lsTestNamespace}, db); err != nil {
-					return err
-				}
-				if db.Annotations == nil {
-					db.Annotations = map[string]string{}
-				}
-				db.Annotations[databasev1.AnnotationSkipArchiveCheck] = "true"
-				return k8sClient.Update(ctx, db)
-			}).Should(Succeed())
-
-			// Create a pod with a running litestream sidecar.
-			pod := createTestPod(ctx, "skip-archive-clear-pod", lsTestNamespace, lsDepName)
-			patchContainerStatuses(ctx, pod, []corev1.ContainerStatus{{
-				Name:  "litestream",
-				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}},
-			}})
-
-			db := &databasev1.LitestreamReplica{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lsDBName, Namespace: lsTestNamespace}, db)).To(Succeed())
-			Expect(reconciler.updateStatus(ctx, db)).To(Succeed())
-
-			// The annotation must be cleared after the sidecar is confirmed healthy.
-			updated := &databasev1.LitestreamReplica{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lsDBName, Namespace: lsTestNamespace}, updated)).To(Succeed())
-			Expect(updated.Annotations[databasev1.AnnotationSkipArchiveCheck]).NotTo(Equal("true"),
-				"skip-archive-check must be cleared once litestream sidecar is healthy")
-		})
-
-		It("does not clear skip-archive-check when sidecar is not yet healthy", func() {
-			// skip-archive-check is set but no healthy pod exists yet.
-			Eventually(func() error {
-				db := &databasev1.LitestreamReplica{}
-				if err := k8sClient.Get(ctx, types.NamespacedName{Name: lsDBName, Namespace: lsTestNamespace}, db); err != nil {
-					return err
-				}
-				if db.Annotations == nil {
-					db.Annotations = map[string]string{}
-				}
-				db.Annotations[databasev1.AnnotationSkipArchiveCheck] = "true"
-				return k8sClient.Update(ctx, db)
-			}).Should(Succeed())
-
-			// No pods — sidecar is not healthy.
-			db := &databasev1.LitestreamReplica{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lsDBName, Namespace: lsTestNamespace}, db)).To(Succeed())
-			Expect(reconciler.updateStatus(ctx, db)).To(Succeed())
-
-			updated := &databasev1.LitestreamReplica{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lsDBName, Namespace: lsTestNamespace}, updated)).To(Succeed())
-			Expect(updated.Annotations[databasev1.AnnotationSkipArchiveCheck]).To(Equal("true"),
-				"skip-archive-check must not be cleared while sidecar is not running")
-		})
-	})
-
-	Describe("archiveCheckState", func() {
-		It("returns (false, passed) when backup is disabled", func() {
-			litestreamReplica.Spec.Backup.Enabled = false
-			wt := &workloadTarget{deployment: deployment}
-			failed, msg := reconciler.archiveCheckState(ctx, litestreamReplica, wt)
-			Expect(failed).To(BeFalse())
-			Expect(msg).To(Equal("backup not enabled"))
-		})
-
-		It("returns (false, passed) when no pods exist", func() {
-			wt := &workloadTarget{deployment: deployment}
-			failed, msg := reconciler.archiveCheckState(ctx, litestreamReplica, wt)
-			Expect(failed).To(BeFalse())
-			Expect(msg).To(Equal("archive check passed"))
-		})
-
-		It("returns (true, failed) when archive-check init container exited non-zero", func() {
-			pod := createTestPod(ctx, "archive-check-fail-pod", lsTestNamespace, lsDepName)
-			patchInitContainerStatuses(ctx, pod, []corev1.ContainerStatus{{
-				Name:  "litestream-archive-check",
-				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}},
-			}})
-			wt := &workloadTarget{deployment: deployment}
-			failed, msg := reconciler.archiveCheckState(ctx, litestreamReplica, wt)
-			Expect(failed).To(BeTrue())
-			Expect(msg).To(ContainSubstring("archive check failed"))
-		})
-
-		It("returns (false, passed) when archive-check init container exited zero", func() {
-			pod := createTestPod(ctx, "archive-check-pass-pod", lsTestNamespace, lsDepName)
-			patchInitContainerStatuses(ctx, pod, []corev1.ContainerStatus{{
-				Name:  "litestream-archive-check",
-				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
-			}})
-			wt := &workloadTarget{deployment: deployment}
-			failed, msg := reconciler.archiveCheckState(ctx, litestreamReplica, wt)
-			Expect(failed).To(BeFalse())
-			Expect(msg).To(Equal("archive check passed"))
-		})
-	})
 })
 
 // ─────────────────────────────────────────────────────────────────────────────

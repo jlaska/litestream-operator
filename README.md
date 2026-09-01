@@ -82,10 +82,10 @@ spec:
   databasePath: /data
   databaseName: app.db
 
-  # Recovery mode: Manual (default) blocks startup if local DB missing but
-  # archive exists; Automatic uses Litestream's native restore flags.
+  # Recovery mode: automatic (default) uses Litestream's native restore flags
+  # with integrity checking; manual requires explicit LitestreamRestore CR.
   recovery:
-    mode: Automatic
+    mode: automatic
 
   backup:
     enabled: true
@@ -124,7 +124,6 @@ kubectl describe litestreamreplica my-app-db -n example
 #   TargetReady          True   DeploymentFound
 #   SidecarReady         True   SidecarRunning
 #   ReplicationHealthy   True   ReplicationWithinThreshold
-#   RecoverySafe         True   ArchiveConsistent
 #   Ready                True   AllConditionsMet
 ```
 
@@ -178,7 +177,8 @@ Litestream does for SQLite what Barman Cloud does for PostgreSQL.
 | `spec.databaseName` | string | yes | Filename of the SQLite database (e.g. `app.db`) |
 | `spec.container` | string | | Application container name. Defaults to the first container. Set when the database volume is mounted in a non-first container |
 | `spec.image` | string | | Litestream image override (default: `litestream/litestream:0.5.14`) |
-| `spec.recovery.mode` | `Manual` \| `Automatic` | | Recovery strategy on pod startup (default: `Manual`) |
+| `spec.recovery.mode` | `manual` \| `automatic` | | Recovery strategy on pod startup (default: `automatic`) |
+| `spec.backup.autoRecover` | bool | | Enable upstream auto-recover for LTX state corruption (default: `false`) |
 | `spec.backup.enabled` | bool | | Enable Litestream replication (default: `false`) |
 | `spec.backup.destination.s3.endpoint` | string | | S3-compatible endpoint URL; omit for AWS S3 |
 | `spec.backup.destination.s3.bucket` | string | when enabled | S3 bucket name |
@@ -201,7 +201,6 @@ Litestream does for SQLite what Barman Cloud does for PostgreSQL.
 | `TargetReady` | Target workload exists and is valid |
 | `SidecarReady` | Litestream sidecar is injected and running |
 | `ReplicationHealthy` | Replication lag is within `maxReplicationLag` threshold |
-| `RecoverySafe` | No archive mismatch detected at startup |
 | `BootstrapApplied` | Bootstrap SQL configured and init container ready |
 | `ReplicationPaused` | Replication intentionally paused (e.g. during restore) |
 | `ReplicaCountExceeded` | Workload has more than one replica (unsafe for SQLite) |
@@ -297,29 +296,51 @@ kubectl get litestreamrestore my-app-restore -n example
 
 ## Recovery modes
 
-### Manual (default)
-
-If local state is missing or inconsistent with the remote archive, block workload startup and require an explicit
-`LitestreamRestore`. This is the safety-first default — a missing database with an existing archive will never
-silently start fresh.
-
-```yaml
-spec:
-  recovery:
-    mode: Manual
-```
-
-### Automatic
+### automatic (default)
 
 Uses upstream Litestream's native restore with idempotent flags (`-if-db-not-exists`, `-if-replica-exists`)
-and integrity checking (`-integrity-check quick`). Any genuine restore failure blocks pod startup —
-the operator never converts a restore error into a fresh database.
+and integrity checking (`-integrity-check quick`). This matches the [upstream recommended deployment pattern](https://litestream.io/reference/restore/#idempotent-deployment-script).
+
+Any genuine restore failure blocks pod startup — the operator never converts a restore error into a fresh database.
 
 ```yaml
 spec:
   recovery:
-    mode: Automatic
+    mode: automatic
 ```
+
+**Startup behavior:**
+
+| Local DB | Remote Archive | Result |
+|---|---|---|
+| Exists | Any | Skip restore (normal restart) |
+| Missing | Exists | **Restore from S3** with integrity check |
+| Missing | Missing | Allow startup (genuinely new database) |
+
+**Recovery procedure**: Scale to 0, delete the DB file, scale to 1. The init container restores from S3 automatically.
+
+### manual
+
+Does not inject a restore init container. Recovery requires creating an explicit `LitestreamRestore` CR with `mode: InPlace`.
+
+```yaml
+spec:
+  recovery:
+    mode: manual
+```
+
+### Auto-recover for LTX corruption
+
+Enable upstream Litestream's [automatic recovery](https://litestream.io/docs/troubleshooting/#option-2-automatic-recovery) to handle LTX state corruption without manual intervention:
+
+```yaml
+spec:
+  backup:
+    enabled: true
+    autoRecover: true
+```
+
+When Litestream encounters persistent LTX errors, it automatically resets local tracking state and creates a fresh snapshot. Recommended for unattended deployments.
 
 ---
 
@@ -406,7 +427,6 @@ The operator uses these annotations on target workloads:
 | `litestream.io/config` | References the LitestreamReplica CR (`namespace/name`) that configures injection |
 | `litestream.io/injection-spec-hash` | Deterministic hash of injection-relevant config; changes trigger rollouts |
 | `litestream.io/pause` | When `"true"` on a CR, pauses replication without killing the sidecar |
-| `litestream.io/skip-archive-check` | When `"true"` on a CR, disables the archive-check init container. Set automatically by the restore controller after an InPlace restore; cleared once the sidecar is healthy |
 
 ---
 
@@ -454,14 +474,6 @@ Existing Prometheus annotations on the pod are preserved (not overwritten).
 ---
 
 ## Troubleshooting
-
-### Startup blocked (Manual recovery mode)
-
-**Symptom**: Pod stuck in init, `RecoverySafe=False`.
-
-**Cause**: Local database is missing but a remote archive exists. Manual mode requires explicit recovery.
-
-**Fix**: Create a `LitestreamRestore` with `mode: InPlace` to restore from the archive.
 
 ### UnsafeRolloutStrategy condition
 

@@ -543,487 +543,6 @@ var _ = Describe("SidecarInjector init container", func() {
 	})
 })
 
-var _ = Describe("SidecarInjector archive check", func() {
-	const (
-		namespace         = "default"
-		acDBName          = "archive-check-db"
-		acDeployName      = "archive-check-app"
-		acDatabaseName    = "app.db"
-		acDatabasePath    = "/data"
-		acVolumeName      = "app-data"
-		acSecretRef       = "s3-creds"
-		injectTrue        = "true"    // goconst
-		appContainerName  = "app"     // goconst
-		appContainerImage = "busybox" // goconst
-	)
-
-	ctx := context.Background()
-
-	newInjector := func() *webhook.SidecarInjector {
-		return &webhook.SidecarInjector{
-			Client:  k8sClient,
-			Decoder: admission.NewDecoder(k8sClient.Scheme()),
-		}
-	}
-
-	newPod := func(annotations map[string]string) *corev1.Pod {
-		return &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "test-pod", Namespace: namespace,
-				Annotations: annotations,
-			},
-			Spec: corev1.PodSpec{
-				Containers: []corev1.Container{{
-					Name: appContainerName, Image: appContainerImage,
-					VolumeMounts: []corev1.VolumeMount{{Name: acVolumeName, MountPath: acDatabasePath}},
-				}},
-				Volumes: []corev1.Volume{{
-					Name:         acVolumeName,
-					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-				}},
-			},
-		}
-	}
-
-	makeRequest := func(pod *corev1.Pod) admission.Request {
-		raw, err := json.Marshal(pod)
-		Expect(err).NotTo(HaveOccurred())
-		return admission.Request{
-			AdmissionRequest: admissionv1.AdmissionRequest{
-				UID: "test-uid", Namespace: namespace,
-				Operation: admissionv1.Create,
-				Object:    runtime.RawExtension{Raw: raw},
-			},
-		}
-	}
-
-	newBackupDB := func(annotations map[string]string) *databasev1.LitestreamReplica {
-		db := &databasev1.LitestreamReplica{
-			ObjectMeta: metav1.ObjectMeta{Name: acDBName, Namespace: namespace, Annotations: annotations},
-			Spec: databasev1.LitestreamReplicaSpec{
-				DatabaseName:     acDatabaseName,
-				DatabasePath:     acDatabasePath,
-				TargetDeployment: acDeployName,
-				Backup: databasev1.BackupSpec{
-					Enabled: true,
-					Destination: databasev1.BackupDestination{
-						S3: &databasev1.S3Destination{Bucket: "test-bucket", SecretRef: acSecretRef},
-					},
-				},
-			},
-		}
-		return db
-	}
-
-	AfterEach(func() {
-		db := &databasev1.LitestreamReplica{}
-		if err := k8sClient.Get(ctx, types.NamespacedName{Name: acDBName, Namespace: namespace}, db); err == nil {
-			_ = k8sClient.Delete(ctx, db)
-		}
-		restoreList := &databasev1.LitestreamRestoreList{}
-		if err := k8sClient.List(ctx, restoreList); err == nil {
-			for i := range restoreList.Items {
-				_ = k8sClient.Delete(ctx, &restoreList.Items[i])
-			}
-		}
-	})
-
-	It("injects archive-check init container when backup is enabled", func() {
-		Expect(k8sClient.Create(ctx, newBackupDB(nil))).To(Succeed())
-
-		annotations := map[string]string{
-			databasev1.AnnotationInject: injectTrue,
-			databasev1.AnnotationConfig: namespace + "/" + acDBName,
-		}
-		resp := newInjector().Handle(ctx, makeRequest(newPod(annotations)))
-		Expect(resp.Allowed).To(BeTrue())
-
-		patched := applyAllPatches(newPod(annotations), resp.Patches)
-		initNames := make([]string, len(patched.Spec.InitContainers))
-		for i, c := range patched.Spec.InitContainers {
-			initNames[i] = c.Name
-		}
-		Expect(initNames).To(ContainElement("litestream-archive-check"))
-	})
-
-	It("archive-check init container is first (before db-bootstrap)", func() {
-		db := newBackupDB(nil)
-		db.Spec.Bootstrap.SQL = "CREATE TABLE t (id INTEGER PRIMARY KEY);"
-		Expect(k8sClient.Create(ctx, db)).To(Succeed())
-
-		annotations := map[string]string{
-			databasev1.AnnotationInject: injectTrue,
-			databasev1.AnnotationConfig: namespace + "/" + acDBName,
-		}
-		resp := newInjector().Handle(ctx, makeRequest(newPod(annotations)))
-		Expect(resp.Allowed).To(BeTrue())
-
-		patched := applyAllPatches(newPod(annotations), resp.Patches)
-		Expect(patched.Spec.InitContainers).To(HaveLen(2))
-		Expect(patched.Spec.InitContainers[0].Name).To(Equal("litestream-archive-check"))
-		Expect(patched.Spec.InitContainers[1].Name).To(Equal("db-bootstrap"))
-	})
-
-	It("archive-check init container has correct volume mounts", func() {
-		Expect(k8sClient.Create(ctx, newBackupDB(nil))).To(Succeed())
-
-		annotations := map[string]string{
-			databasev1.AnnotationInject: injectTrue,
-			databasev1.AnnotationConfig: namespace + "/" + acDBName,
-		}
-		resp := newInjector().Handle(ctx, makeRequest(newPod(annotations)))
-		Expect(resp.Allowed).To(BeTrue())
-
-		patched := applyAllPatches(newPod(annotations), resp.Patches)
-		var archiveCheck corev1.Container
-		for _, c := range patched.Spec.InitContainers {
-			if c.Name == "litestream-archive-check" {
-				archiveCheck = c
-				break
-			}
-		}
-
-		mountPaths := make([]string, len(archiveCheck.VolumeMounts))
-		for i, vm := range archiveCheck.VolumeMounts {
-			mountPaths[i] = vm.MountPath
-		}
-		Expect(mountPaths).To(ContainElement(acDatabasePath))
-		Expect(mountPaths).To(ContainElement("/etc/litestream"))
-	})
-
-	It("archive-check init container has S3 credential env vars", func() {
-		Expect(k8sClient.Create(ctx, newBackupDB(nil))).To(Succeed())
-
-		annotations := map[string]string{
-			databasev1.AnnotationInject: injectTrue,
-			databasev1.AnnotationConfig: namespace + "/" + acDBName,
-		}
-		resp := newInjector().Handle(ctx, makeRequest(newPod(annotations)))
-		Expect(resp.Allowed).To(BeTrue())
-
-		patched := applyAllPatches(newPod(annotations), resp.Patches)
-		var archiveCheck corev1.Container
-		for _, c := range patched.Spec.InitContainers {
-			if c.Name == "litestream-archive-check" {
-				archiveCheck = c
-				break
-			}
-		}
-
-		envNames := make([]string, len(archiveCheck.Env))
-		for i, e := range archiveCheck.Env {
-			envNames[i] = e.Name
-		}
-		Expect(envNames).To(ContainElements("LITESTREAM_ACCESS_KEY_ID", "LITESTREAM_SECRET_ACCESS_KEY"))
-
-		for _, e := range archiveCheck.Env {
-			if e.Name == "LITESTREAM_ACCESS_KEY_ID" {
-				Expect(e.ValueFrom.SecretKeyRef.Name).To(Equal(acSecretRef))
-			}
-		}
-	})
-
-	It("archive-check script references the correct database path", func() {
-		Expect(k8sClient.Create(ctx, newBackupDB(nil))).To(Succeed())
-
-		annotations := map[string]string{
-			databasev1.AnnotationInject: injectTrue,
-			databasev1.AnnotationConfig: namespace + "/" + acDBName,
-		}
-		resp := newInjector().Handle(ctx, makeRequest(newPod(annotations)))
-		Expect(resp.Allowed).To(BeTrue())
-
-		patched := applyAllPatches(newPod(annotations), resp.Patches)
-		var archiveCheck corev1.Container
-		for _, c := range patched.Spec.InitContainers {
-			if c.Name == "litestream-archive-check" {
-				archiveCheck = c
-				break
-			}
-		}
-		script := strings.Join(archiveCheck.Command, " ")
-		Expect(script).To(ContainSubstring(acDatabasePath + "/" + acDatabaseName))
-		// -if-replica-exists makes litestream exit 0 for "no backups found" while still
-		// exiting 1 for real errors (broken chain, credentials, network, corruption).
-		Expect(script).To(ContainSubstring("-if-replica-exists"),
-			"archive-check must use -if-replica-exists to distinguish empty bucket from errors")
-		// Probe file existence distinguishes "restored" (file present) from "no data" (absent).
-		Expect(script).To(ContainSubstring(`-f "${PROBE}"`),
-			"archive-check must check probe file existence after a successful restore")
-		// Litestream errors must not be suppressed — surfacing them is essential for
-		// diagnosing why archive-check blocks startup.
-		Expect(script).NotTo(ContainSubstring("2>/dev/null"),
-			"archive-check must not suppress litestream stderr")
-		Expect(script).To(ContainSubstring("2>&1"),
-			"archive-check must capture litestream output for logging")
-	})
-
-	It("archive-check script blocks startup on non-zero litestream exit", func() {
-		Expect(k8sClient.Create(ctx, newBackupDB(nil))).To(Succeed())
-
-		annotations := map[string]string{
-			databasev1.AnnotationInject: injectTrue,
-			databasev1.AnnotationConfig: namespace + "/" + acDBName,
-		}
-		resp := newInjector().Handle(ctx, makeRequest(newPod(annotations)))
-		Expect(resp.Allowed).To(BeTrue())
-
-		patched := applyAllPatches(newPod(annotations), resp.Patches)
-		var archiveCheck corev1.Container
-		for _, c := range patched.Spec.InitContainers {
-			if c.Name == "litestream-archive-check" {
-				archiveCheck = c
-				break
-			}
-		}
-		script := strings.Join(archiveCheck.Command, " ")
-		// Non-zero exit from litestream restore must block startup and surface the error output.
-		Expect(script).To(ContainSubstring("RESTORE_EXIT} -ne 0"),
-			"archive-check must exit 1 on any non-zero litestream restore exit")
-		Expect(script).To(ContainSubstring("${RESTORE_OUTPUT}"),
-			"archive-check must surface the litestream error output on failure")
-	})
-
-	It("does not inject archive-check when backup is disabled", func() {
-		db := &databasev1.LitestreamReplica{
-			ObjectMeta: metav1.ObjectMeta{Name: acDBName, Namespace: namespace},
-			Spec: databasev1.LitestreamReplicaSpec{
-				DatabaseName:     acDatabaseName,
-				DatabasePath:     acDatabasePath,
-				TargetDeployment: acDeployName,
-				Backup:           databasev1.BackupSpec{Enabled: false},
-			},
-		}
-		Expect(k8sClient.Create(ctx, db)).To(Succeed())
-
-		annotations := map[string]string{
-			databasev1.AnnotationInject: injectTrue,
-			databasev1.AnnotationConfig: namespace + "/" + acDBName,
-		}
-		resp := newInjector().Handle(ctx, makeRequest(newPod(annotations)))
-		Expect(resp.Allowed).To(BeTrue())
-
-		patched := applyAllPatches(newPod(annotations), resp.Patches)
-		for _, c := range patched.Spec.InitContainers {
-			Expect(c.Name).NotTo(Equal("litestream-archive-check"))
-		}
-	})
-
-	It("does not inject archive-check when skip-archive-check annotation is set on LitestreamReplica", func() {
-		annotations := map[string]string{
-			databasev1.AnnotationSkipArchiveCheck: "true",
-		}
-		Expect(k8sClient.Create(ctx, newBackupDB(annotations))).To(Succeed())
-
-		podAnnotations := map[string]string{
-			databasev1.AnnotationInject: injectTrue,
-			databasev1.AnnotationConfig: namespace + "/" + acDBName,
-		}
-		resp := newInjector().Handle(ctx, makeRequest(newPod(podAnnotations)))
-		Expect(resp.Allowed).To(BeTrue())
-
-		patched := applyAllPatches(newPod(podAnnotations), resp.Patches)
-		for _, c := range patched.Spec.InitContainers {
-			Expect(c.Name).NotTo(Equal("litestream-archive-check"))
-		}
-	})
-
-	It("skips archive-check via hasActiveRestore when a completed restore exists", func() {
-		db := newBackupDB(nil)
-		Expect(k8sClient.Create(ctx, db)).To(Succeed())
-
-		restore := &databasev1.LitestreamRestore{
-			ObjectMeta: metav1.ObjectMeta{Name: "ac-restore", Namespace: namespace},
-			Spec: databasev1.LitestreamRestoreSpec{
-				SourceRef: databasev1.RestoreSourceRef{Name: acDBName},
-			},
-		}
-		Expect(k8sClient.Create(ctx, restore)).To(Succeed())
-		restore.Status.Phase = databasev1.RestorePhaseCompleted
-		Expect(k8sClient.Status().Update(ctx, restore)).To(Succeed())
-
-		podAnnotations := map[string]string{
-			databasev1.AnnotationInject: injectTrue,
-			databasev1.AnnotationConfig: namespace + "/" + acDBName,
-		}
-		resp := newInjector().Handle(ctx, makeRequest(newPod(podAnnotations)))
-		Expect(resp.Allowed).To(BeTrue())
-
-		patched := applyAllPatches(newPod(podAnnotations), resp.Patches)
-		for _, c := range patched.Spec.InitContainers {
-			Expect(c.Name).NotTo(Equal("litestream-archive-check"))
-		}
-	})
-
-	It("skips archive-check via hasActiveRestore when a resuming restore exists", func() {
-		db := newBackupDB(nil)
-		Expect(k8sClient.Create(ctx, db)).To(Succeed())
-
-		restore := &databasev1.LitestreamRestore{
-			ObjectMeta: metav1.ObjectMeta{Name: "ac-restore-resuming", Namespace: namespace},
-			Spec: databasev1.LitestreamRestoreSpec{
-				SourceRef: databasev1.RestoreSourceRef{Name: acDBName},
-			},
-		}
-		Expect(k8sClient.Create(ctx, restore)).To(Succeed())
-		restore.Status.Phase = databasev1.RestorePhaseResuming
-		Expect(k8sClient.Status().Update(ctx, restore)).To(Succeed())
-
-		podAnnotations := map[string]string{
-			databasev1.AnnotationInject: injectTrue,
-			databasev1.AnnotationConfig: namespace + "/" + acDBName,
-		}
-		resp := newInjector().Handle(ctx, makeRequest(newPod(podAnnotations)))
-		Expect(resp.Allowed).To(BeTrue())
-
-		patched := applyAllPatches(newPod(podAnnotations), resp.Patches)
-		for _, c := range patched.Spec.InitContainers {
-			Expect(c.Name).NotTo(Equal("litestream-archive-check"))
-		}
-	})
-
-	It("archive-check init container uses the same image as the Litestream sidecar", func() {
-		const customImage = "litestream/litestream:custom-tag"
-		db := newBackupDB(nil)
-		db.Spec.Image = customImage
-		Expect(k8sClient.Create(ctx, db)).To(Succeed())
-
-		annotations := map[string]string{
-			databasev1.AnnotationInject: injectTrue,
-			databasev1.AnnotationConfig: namespace + "/" + acDBName,
-		}
-		resp := newInjector().Handle(ctx, makeRequest(newPod(annotations)))
-		Expect(resp.Allowed).To(BeTrue())
-
-		patched := applyAllPatches(newPod(annotations), resp.Patches)
-		var archiveCheck corev1.Container
-		for _, c := range patched.Spec.InitContainers {
-			if c.Name == "litestream-archive-check" {
-				archiveCheck = c
-				break
-			}
-		}
-		var sidecar corev1.Container
-		for _, c := range patched.Spec.Containers {
-			if c.Name == "litestream" {
-				sidecar = c
-				break
-			}
-		}
-		Expect(archiveCheck.Image).To(Equal(sidecar.Image))
-		Expect(archiveCheck.Image).To(Equal(customImage))
-	})
-
-	It("does not inject any startup init container when backup enabled, recovery.mode=Manual, skip-archive-check=true", func() {
-		annotations := map[string]string{
-			databasev1.AnnotationSkipArchiveCheck: "true",
-		}
-		db := newBackupDB(annotations)
-		db.Spec.Recovery.Mode = databasev1.RecoveryModeManual
-		Expect(k8sClient.Create(ctx, db)).To(Succeed())
-
-		podAnnotations := map[string]string{
-			databasev1.AnnotationInject: injectTrue,
-			databasev1.AnnotationConfig: namespace + "/" + acDBName,
-		}
-		resp := newInjector().Handle(ctx, makeRequest(newPod(podAnnotations)))
-		Expect(resp.Allowed).To(BeTrue())
-
-		patched := applyAllPatches(newPod(podAnnotations), resp.Patches)
-		for _, c := range patched.Spec.InitContainers {
-			Expect(c.Name).NotTo(Equal("litestream-archive-check"))
-			Expect(c.Name).NotTo(Equal("litestream-restore"))
-		}
-	})
-
-	It("archive-check script exits 0 only when both DB file and state dir exist", func() {
-		Expect(k8sClient.Create(ctx, newBackupDB(nil))).To(Succeed())
-
-		annotations := map[string]string{
-			databasev1.AnnotationInject: injectTrue,
-			databasev1.AnnotationConfig: namespace + "/" + acDBName,
-		}
-		resp := newInjector().Handle(ctx, makeRequest(newPod(annotations)))
-		Expect(resp.Allowed).To(BeTrue())
-
-		patched := applyAllPatches(newPod(annotations), resp.Patches)
-		var archiveCheck corev1.Container
-		for _, c := range patched.Spec.InitContainers {
-			if c.Name == "litestream-archive-check" {
-				archiveCheck = c
-				break
-			}
-		}
-		script := strings.Join(archiveCheck.Command, " ")
-		// The script must check for the state directory alongside the DB file.
-		// Both must exist for an early exit — a DB without the state dir falls through
-		// to the S3 probe to catch fresh/recreated databases (issue #109).
-		Expect(script).To(ContainSubstring(`-d "${STATE_DIR}"`),
-			"archive-check must test for state directory existence")
-		Expect(script).To(ContainSubstring("STATE_DIR="),
-			"archive-check must define STATE_DIR variable")
-		// Early exit only when both DB and state dir exist.
-		Expect(script).To(ContainSubstring("skipping check"),
-			"archive-check must exit 0 when both DB and state dir are present")
-	})
-
-	It("archive-check script uses the correct state directory path convention", func() {
-		Expect(k8sClient.Create(ctx, newBackupDB(nil))).To(Succeed())
-
-		annotations := map[string]string{
-			databasev1.AnnotationInject: injectTrue,
-			databasev1.AnnotationConfig: namespace + "/" + acDBName,
-		}
-		resp := newInjector().Handle(ctx, makeRequest(newPod(annotations)))
-		Expect(resp.Allowed).To(BeTrue())
-
-		patched := applyAllPatches(newPod(annotations), resp.Patches)
-		var archiveCheck corev1.Container
-		for _, c := range patched.Spec.InitContainers {
-			if c.Name == "litestream-archive-check" {
-				archiveCheck = c
-				break
-			}
-		}
-		script := strings.Join(archiveCheck.Command, " ")
-		// Litestream state dir is .<dbfilename>-litestream (MetaDirSuffix = "-litestream").
-		// Documented at https://litestream.io/tips/#deleting-sqlite-databases
-		expectedStateDir := acDatabasePath + "/." + acDatabaseName + "-litestream"
-		Expect(script).To(ContainSubstring(expectedStateDir),
-			"archive-check state directory must use .<dbname>-litestream naming convention")
-	})
-
-	It("archive-check script probes S3 when DB exists but state dir is absent", func() {
-		Expect(k8sClient.Create(ctx, newBackupDB(nil))).To(Succeed())
-
-		annotations := map[string]string{
-			databasev1.AnnotationInject: injectTrue,
-			databasev1.AnnotationConfig: namespace + "/" + acDBName,
-		}
-		resp := newInjector().Handle(ctx, makeRequest(newPod(annotations)))
-		Expect(resp.Allowed).To(BeTrue())
-
-		patched := applyAllPatches(newPod(annotations), resp.Patches)
-		var archiveCheck corev1.Container
-		for _, c := range patched.Spec.InitContainers {
-			if c.Name == "litestream-archive-check" {
-				archiveCheck = c
-				break
-			}
-		}
-		script := strings.Join(archiveCheck.Command, " ")
-		// When DB exists but state dir is absent, the script must NOT exit 0.
-		// It must continue to the S3 probe (litestream restore).
-		// Verify this by checking: (a) state dir test is present, (b) S3 probe follows.
-		Expect(script).To(ContainSubstring(`-d "${STATE_DIR}"`),
-			"archive-check must test for state directory")
-		Expect(script).To(ContainSubstring("probing S3"),
-			"archive-check must continue to S3 probe when state dir is absent")
-		Expect(script).To(ContainSubstring("litestream restore"),
-			"archive-check must invoke litestream restore as the S3 probe")
-	})
-})
-
 var _ = Describe("SidecarInjector auto-restore", func() {
 	const (
 		namespace         = "default"
@@ -1112,7 +631,7 @@ var _ = Describe("SidecarInjector auto-restore", func() {
 		}
 	}
 
-	It("injects auto-restore init container (not archive-check) when recovery.mode=Automatic", func() {
+	It("injects auto-restore init container when backup is enabled", func() {
 		resp := newInjector().Handle(ctx, makeRequest(newPod(annotations())))
 		Expect(resp.Allowed).To(BeTrue())
 
@@ -1122,7 +641,6 @@ var _ = Describe("SidecarInjector auto-restore", func() {
 			initNames[i] = c.Name
 		}
 		Expect(initNames).To(ContainElement("litestream-restore"))
-		Expect(initNames).NotTo(ContainElement("litestream-archive-check"))
 	})
 
 	It("auto-restore init container is the first init container", func() {
@@ -1187,6 +705,78 @@ var _ = Describe("SidecarInjector auto-restore", func() {
 			envNames[i] = e.Name
 		}
 		Expect(envNames).To(ContainElements("LITESTREAM_ACCESS_KEY_ID", "LITESTREAM_SECRET_ACCESS_KEY"))
+	})
+
+	It("does not inject any restore init container when recovery.mode=manual", func() {
+		// Create a second DB with manual recovery mode.
+		manualDBName := "manual-mode-db"
+		manualDB := &databasev1.LitestreamReplica{
+			ObjectMeta: metav1.ObjectMeta{Name: manualDBName, Namespace: namespace},
+			Spec: databasev1.LitestreamReplicaSpec{
+				DatabaseName:     arDatabaseName,
+				DatabasePath:     arDatabasePath,
+				TargetDeployment: "manual-app",
+				Recovery:         databasev1.RecoverySpec{Mode: databasev1.RecoveryModeManual},
+				Backup: databasev1.BackupSpec{
+					Enabled: true,
+					Destination: databasev1.BackupDestination{
+						S3: &databasev1.S3Destination{
+							Bucket:    "manual-bucket",
+							SecretRef: "manual-s3-creds",
+						},
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, manualDB)).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(ctx, manualDB)
+		}()
+
+		manualAnnotations := map[string]string{
+			databasev1.AnnotationInject: injectTrue,
+			databasev1.AnnotationConfig: namespace + "/" + manualDBName,
+		}
+		resp := newInjector().Handle(ctx, makeRequest(newPod(manualAnnotations)))
+		Expect(resp.Allowed).To(BeTrue())
+
+		patched := applyAllPatches(newPod(manualAnnotations), resp.Patches)
+		for _, c := range patched.Spec.InitContainers {
+			Expect(c.Name).NotTo(Equal("litestream-restore"),
+				"manual mode must not inject auto-restore init container")
+			Expect(c.Name).NotTo(Equal("litestream-archive-check"),
+				"manual mode must not inject archive-check init container")
+		}
+	})
+
+	It("does not inject restore init container when backup is disabled", func() {
+		noBackupDBName := "no-backup-db"
+		noBackupDB := &databasev1.LitestreamReplica{
+			ObjectMeta: metav1.ObjectMeta{Name: noBackupDBName, Namespace: namespace},
+			Spec: databasev1.LitestreamReplicaSpec{
+				DatabaseName:     arDatabaseName,
+				DatabasePath:     arDatabasePath,
+				TargetDeployment: "no-backup-app",
+				Backup:           databasev1.BackupSpec{Enabled: false},
+			},
+		}
+		Expect(k8sClient.Create(ctx, noBackupDB)).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(ctx, noBackupDB)
+		}()
+
+		noBackupAnnotations := map[string]string{
+			databasev1.AnnotationInject: injectTrue,
+			databasev1.AnnotationConfig: namespace + "/" + noBackupDBName,
+		}
+		resp := newInjector().Handle(ctx, makeRequest(newPod(noBackupAnnotations)))
+		Expect(resp.Allowed).To(BeTrue())
+
+		patched := applyAllPatches(newPod(noBackupAnnotations), resp.Patches)
+		for _, c := range patched.Spec.InitContainers {
+			Expect(c.Name).NotTo(Equal("litestream-restore"),
+				"backup disabled must not inject auto-restore init container")
+		}
 	})
 })
 
@@ -1664,24 +1254,24 @@ var _ = Describe("SidecarInjector SecurityContext from runAsUser/runAsGroup", fu
 		databasev1.AnnotationConfig: namespace + "/" + scDBName,
 	}
 
-	It("archive-check init container has no SecurityContext when RunAsUser/RunAsGroup omitted", func() {
+	It("auto-restore init container has no SecurityContext when RunAsUser/RunAsGroup omitted", func() {
 		Expect(k8sClient.Create(ctx, newBackupDB(nil, nil))).To(Succeed())
 
 		resp := newInjector().Handle(ctx, makeRequest(newPod(annotations)))
 		Expect(resp.Allowed).To(BeTrue())
 
 		patched := applyAllPatches(newPod(annotations), resp.Patches)
-		var archiveCheck corev1.Container
+		var restore corev1.Container
 		for _, c := range patched.Spec.InitContainers {
-			if c.Name == "litestream-archive-check" {
-				archiveCheck = c
+			if c.Name == "litestream-restore" {
+				restore = c
 				break
 			}
 		}
-		Expect(archiveCheck.SecurityContext).To(BeNil())
+		Expect(restore.SecurityContext).To(BeNil())
 	})
 
-	It("archive-check init container gets SecurityContext when RunAsUser set", func() {
+	It("auto-restore init container gets SecurityContext when RunAsUser set", func() {
 		uid, gid := int64(1000), int64(2000)
 		Expect(k8sClient.Create(ctx, newBackupDB(&uid, &gid))).To(Succeed())
 
@@ -1689,16 +1279,16 @@ var _ = Describe("SidecarInjector SecurityContext from runAsUser/runAsGroup", fu
 		Expect(resp.Allowed).To(BeTrue())
 
 		patched := applyAllPatches(newPod(annotations), resp.Patches)
-		var archiveCheck corev1.Container
+		var restore corev1.Container
 		for _, c := range patched.Spec.InitContainers {
-			if c.Name == "litestream-archive-check" {
-				archiveCheck = c
+			if c.Name == "litestream-restore" {
+				restore = c
 				break
 			}
 		}
-		Expect(archiveCheck.SecurityContext).NotTo(BeNil())
-		Expect(*archiveCheck.SecurityContext.RunAsUser).To(Equal(int64(1000)))
-		Expect(*archiveCheck.SecurityContext.RunAsGroup).To(Equal(int64(2000)))
+		Expect(restore.SecurityContext).NotTo(BeNil())
+		Expect(*restore.SecurityContext.RunAsUser).To(Equal(int64(1000)))
+		Expect(*restore.SecurityContext.RunAsGroup).To(Equal(int64(2000)))
 	})
 
 	It("db-bootstrap init container gets SecurityContext when RunAsUser set", func() {

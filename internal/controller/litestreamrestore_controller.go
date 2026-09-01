@@ -192,21 +192,21 @@ func (r *LitestreamRestoreReconciler) handleFinalization(ctx context.Context, re
 	return ctrl.Result{}, nil
 }
 
-// resolveRestoreTarget resolves the target PVC and path for the restore.
+// resolveRestoreTarget resolves the target PVC, path, and subPath for the restore.
 // For InPlace mode, it derives them from the source LitestreamReplica's target workload.
 // For ToPVC mode, it reads them from the restore spec.
-func (r *LitestreamRestoreReconciler) resolveRestoreTarget(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) (pvc, path string, err error) {
+func (r *LitestreamRestoreReconciler) resolveRestoreTarget(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) (pvc, path, subPath string, err error) {
 	if restore.Spec.Mode == databasev1.RestoreModeToPVC {
 		if restore.Spec.Target == nil {
-			return "", "", fmt.Errorf("mode is ToPVC but target is not specified")
+			return "", "", "", fmt.Errorf("mode is ToPVC but target is not specified")
 		}
-		return restore.Spec.Target.PVC, restore.Spec.Target.Path, nil
+		return restore.Spec.Target.PVC, restore.Spec.Target.Path, "", nil
 	}
 
 	// InPlace mode: derive from source workload.
 	wt, err := r.getTargetWorkloadForRestore(ctx, sourceDB)
 	if err != nil {
-		return "", "", fmt.Errorf("resolving InPlace target: cannot find workload for LitestreamReplica %q: %w", sourceDB.Name, err)
+		return "", "", "", fmt.Errorf("resolving InPlace target: cannot find workload for LitestreamReplica %q: %w", sourceDB.Name, err)
 	}
 
 	dbPath := sourceDB.Spec.DatabasePath
@@ -220,7 +220,7 @@ func (r *LitestreamRestoreReconciler) resolveRestoreTarget(ctx context.Context, 
 	}
 
 	if len(podSpec.Containers) == 0 {
-		return "", "", fmt.Errorf("target workload has no containers")
+		return "", "", "", fmt.Errorf("target workload has no containers")
 	}
 
 	// Use explicit container selection when spec.container is set.
@@ -233,34 +233,35 @@ func (r *LitestreamRestoreReconciler) resolveRestoreTarget(ctx context.Context, 
 			}
 		}
 		if targetContainer == nil {
-			return "", "", fmt.Errorf("container %q not found in workload pod spec", sourceDB.Spec.Container)
+			return "", "", "", fmt.Errorf("container %q not found in workload pod spec", sourceDB.Spec.Container)
 		}
 	} else {
 		targetContainer = &podSpec.Containers[0]
 	}
 
 	// Find best-matching volume mount (longest prefix).
-	var volumeName string
+	var bestMatch *corev1.VolumeMount
 	var bestLen int
-	for _, vm := range targetContainer.VolumeMounts {
+	for i := range targetContainer.VolumeMounts {
+		vm := &targetContainer.VolumeMounts[i]
 		if vm.MountPath == dbPath || strings.HasPrefix(dbPath, vm.MountPath+"/") {
 			if len(vm.MountPath) > bestLen {
-				volumeName = vm.Name
+				bestMatch = vm
 				bestLen = len(vm.MountPath)
 			}
 		}
 	}
-	if volumeName == "" {
-		return "", "", fmt.Errorf("no volume mount in container %q covers database path %q", targetContainer.Name, dbPath)
+	if bestMatch == nil {
+		return "", "", "", fmt.Errorf("no volume mount in container %q covers database path %q", targetContainer.Name, dbPath)
 	}
 
 	for _, vol := range podSpec.Volumes {
-		if vol.Name == volumeName && vol.PersistentVolumeClaim != nil {
-			return vol.PersistentVolumeClaim.ClaimName, dbFullPath, nil
+		if vol.Name == bestMatch.Name && vol.PersistentVolumeClaim != nil {
+			return vol.PersistentVolumeClaim.ClaimName, dbFullPath, bestMatch.SubPath, nil
 		}
 	}
 
-	return "", "", fmt.Errorf("volume %q backing database path %q is not a PersistentVolumeClaim", volumeName, dbPath)
+	return "", "", "", fmt.Errorf("volume %q backing database path %q is not a PersistentVolumeClaim", bestMatch.Name, dbPath)
 }
 
 // reconcilePending handles the initial phase.
@@ -269,8 +270,8 @@ func (r *LitestreamRestoreReconciler) resolveRestoreTarget(ctx context.Context, 
 func (r *LitestreamRestoreReconciler) reconcilePending(ctx context.Context, restore *databasev1.LitestreamRestore, sourceDB *databasev1.LitestreamReplica) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	// Resolve target PVC and path.
-	targetPVC, targetPath, err := r.resolveRestoreTarget(ctx, restore, sourceDB)
+	// Resolve target PVC, path, and subPath.
+	targetPVC, targetPath, targetSubPath, err := r.resolveRestoreTarget(ctx, restore, sourceDB)
 	if err != nil {
 		return ctrl.Result{}, r.failRestore(ctx, restore,
 			fmt.Sprintf("resolving restore target: %v", err))
@@ -281,6 +282,7 @@ func (r *LitestreamRestoreReconciler) reconcilePending(ctx context.Context, rest
 		patch := client.MergeFrom(restore.DeepCopy())
 		restore.Status.ResolvedPVC = targetPVC
 		restore.Status.ResolvedPath = targetPath
+		restore.Status.ResolvedSubPath = targetSubPath
 		if err := r.Status().Patch(ctx, restore, patch); err != nil {
 			return ctrl.Result{}, fmt.Errorf("storing resolved target in status: %w", err)
 		}
@@ -293,7 +295,7 @@ func (r *LitestreamRestoreReconciler) reconcilePending(ctx context.Context, rest
 		}
 
 		jobName := restore.Name + "-restore"
-		newJob := r.buildRestoreJob(restore, sourceDB, jobName, targetPVC, targetPath)
+		newJob := r.buildRestoreJob(restore, sourceDB, jobName, targetPVC, targetPath, targetSubPath)
 		if err := controllerutil.SetControllerReference(restore, newJob, r.Scheme); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -473,6 +475,7 @@ func (r *LitestreamRestoreReconciler) reconcileFencing(ctx context.Context, rest
 
 	targetPVC := restore.Status.ResolvedPVC
 	targetPath := restore.Status.ResolvedPath
+	targetSubPath := restore.Status.ResolvedSubPath
 
 	// Create a fresh litestream ConfigMap for the restore job.
 	if err := r.reconcileRestoreConfig(ctx, restore, sourceDB); err != nil {
@@ -481,7 +484,7 @@ func (r *LitestreamRestoreReconciler) reconcileFencing(ctx context.Context, rest
 
 	// Create the restore Job.
 	jobName := restore.Name + "-restore"
-	newJob := r.buildRestoreJob(restore, sourceDB, jobName, targetPVC, targetPath)
+	newJob := r.buildRestoreJob(restore, sourceDB, jobName, targetPVC, targetPath, targetSubPath)
 	if err := controllerutil.SetControllerReference(restore, newJob, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -578,25 +581,6 @@ func (r *LitestreamRestoreReconciler) reconcileResuming(ctx context.Context, res
 		return ctrl.Result{RequeueAfter: restoreRequeueInterval}, nil
 	}
 
-	// Set skip-archive-check and verify it's visible to the API server before
-	// scaling up. The annotation is set via merge patch, but a concurrent
-	// Status().Patch from the replica controller can cause the informer cache
-	// to lose the annotation. We use the uncached APIReader for both the set
-	// and the verify to ensure the annotation is durably on the API server.
-	if err := r.setSkipArchiveCheck(ctx, sourceDB, true); err != nil {
-		return ctrl.Result{}, fmt.Errorf("setting skip-archive-check on LitestreamReplica: %w", err)
-	}
-	verify := &databasev1.LitestreamReplica{}
-	if err := r.APIReader.Get(ctx, types.NamespacedName{
-		Namespace: sourceDB.Namespace, Name: sourceDB.Name,
-	}, verify); err != nil {
-		return ctrl.Result{RequeueAfter: restoreRequeueInterval}, nil
-	}
-	if verify.Annotations[databasev1.AnnotationSkipArchiveCheck] != injectEnabled {
-		log.Info("skip-archive-check annotation not yet visible on API server; requeueing")
-		return ctrl.Result{RequeueAfter: restoreRequeueInterval}, nil
-	}
-
 	target := int32(1)
 	if restore.Status.OriginalReplicas != nil {
 		target = *restore.Status.OriginalReplicas
@@ -688,37 +672,6 @@ func (r *LitestreamRestoreReconciler) resumeReplication(ctx context.Context, db 
 	return r.Patch(ctx, latest, patch)
 }
 
-// setSkipArchiveCheck sets or removes the skip-archive-check annotation on a LitestreamReplica.
-// It uses the uncached API reader to get the latest state directly from the API
-// server, avoiding races where the informer cache returns a stale version that
-// lacks the annotation (set by a previous call) because a concurrent Status().Patch
-// response overwrote it in the cache.
-func (r *LitestreamRestoreReconciler) setSkipArchiveCheck(ctx context.Context, db *databasev1.LitestreamReplica, enable bool) error {
-	latest := &databasev1.LitestreamReplica{}
-	if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: db.Namespace, Name: db.Name}, latest); err != nil {
-		return err
-	}
-	if enable {
-		if latest.Annotations[databasev1.AnnotationSkipArchiveCheck] == injectEnabled {
-			return nil
-		}
-	} else {
-		if latest.Annotations[databasev1.AnnotationSkipArchiveCheck] != injectEnabled {
-			return nil
-		}
-	}
-	patch := client.MergeFrom(latest.DeepCopy())
-	if latest.Annotations == nil {
-		latest.Annotations = map[string]string{}
-	}
-	if enable {
-		latest.Annotations[databasev1.AnnotationSkipArchiveCheck] = injectEnabled
-	} else {
-		delete(latest.Annotations, databasev1.AnnotationSkipArchiveCheck)
-	}
-	return r.Patch(ctx, latest, patch)
-}
-
 // releaseRestoreLock deletes the Lease used for restore concurrency control.
 // Best-effort: errors are silently ignored.
 func (r *LitestreamRestoreReconciler) releaseRestoreLock(ctx context.Context, restore *databasev1.LitestreamRestore) {
@@ -736,10 +689,12 @@ func (r *LitestreamRestoreReconciler) releaseRestoreLock(ctx context.Context, re
 }
 
 // buildRestoreJob constructs the Job that runs `litestream restore`.
+// The restore command is wrapped in a shell script that logs the exact command
+// being run and cleans up partial output files on failure.
 func (r *LitestreamRestoreReconciler) buildRestoreJob(
 	restore *databasev1.LitestreamRestore,
 	sourceDB *databasev1.LitestreamReplica,
-	jobName, targetPVC, targetPath string,
+	jobName, targetPVC, targetPath, subPath string,
 ) *batchv1.Job {
 	s3 := sourceDB.Spec.Backup.Destination.S3
 
@@ -752,21 +707,50 @@ func (r *LitestreamRestoreReconciler) buildRestoreJob(
 	}
 
 	dbPathInConfig := sourceDB.Spec.DatabasePath + "/" + sourceDB.Spec.DatabaseName
-	args := []string{
-		"restore",
-		"-config", "/etc/litestream/litestream.yml",
-		"-integrity-check", "quick",
-		"-o", targetPath,
-	}
+
+	// Build the litestream restore command as a shell script for logging and cleanup.
+	restoreCmd := fmt.Sprintf("litestream restore -config /etc/litestream/litestream.yml -integrity-check quick -o %q", targetPath)
 	if restore.Spec.Force {
-		args = append(args, "-force")
+		restoreCmd += " -force"
 	}
 	if restore.Spec.Timestamp != "" {
-		args = append(args, "-timestamp", restore.Spec.Timestamp)
+		restoreCmd += fmt.Sprintf(" -timestamp %q", restore.Spec.Timestamp)
 	}
-	args = append(args, dbPathInConfig)
+	restoreCmd += fmt.Sprintf(" %q", dbPathInConfig)
+
+	// Guard: refuse to overwrite an existing file unless -force is set.
+	// Litestream's -o flag silently overwrites, so we add an explicit check.
+	forceGuard := ""
+	if !restore.Spec.Force {
+		forceGuard = fmt.Sprintf(`TARGET_PATH=%q
+if [ -f "${TARGET_PATH}" ]; then
+  echo "litestream-restore: REFUSED — output file ${TARGET_PATH} already exists"
+  echo "litestream-restore: set spec.force=true to overwrite, or delete the file first"
+  exit 1
+fi
+`, targetPath)
+	}
+
+	script := fmt.Sprintf(`%secho "litestream-restore: running: %s"
+%s
+RESTORE_EXIT=$?
+if [ $RESTORE_EXIT -ne 0 ]; then
+  echo "litestream-restore: FAILED (exit code ${RESTORE_EXIT}) — cleaning up partial output"
+  rm -f %q
+  exit $RESTORE_EXIT
+fi
+echo "litestream-restore: restore completed successfully"
+`, forceGuard, restoreCmd, restoreCmd, targetPath)
 
 	mountPath := filepath.Dir(targetPath)
+	targetVolumeMount := corev1.VolumeMount{
+		Name:      restoreTargetVolumeName,
+		MountPath: mountPath,
+	}
+	if subPath != "" {
+		targetVolumeMount.SubPath = subPath
+	}
+
 	jobLabels := map[string]string{
 		"app.kubernetes.io/managed-by": "litestream-operator",
 		restoreLabelKey:                restore.Name,
@@ -776,12 +760,12 @@ func (r *LitestreamRestoreReconciler) buildRestoreJob(
 		RestartPolicy: corev1.RestartPolicyOnFailure,
 		Containers: []corev1.Container{
 			{
-				Name:  "litestream-restore",
-				Image: image,
-				Args:  args,
-				Env:   s3EnvVars(s3.SecretRef),
+				Name:    "litestream-restore",
+				Image:   image,
+				Command: []string{"sh", "-c", script},
+				Env:     s3EnvVars(s3.SecretRef),
 				VolumeMounts: []corev1.VolumeMount{
-					{Name: restoreTargetVolumeName, MountPath: mountPath},
+					targetVolumeMount,
 					{Name: "litestream-config", MountPath: "/etc/litestream", ReadOnly: true},
 				},
 			},

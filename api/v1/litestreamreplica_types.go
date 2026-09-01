@@ -90,31 +90,39 @@ type BackupSpec struct {
 	// sidecar container. When omitted, a default ephemeral-storage limit is applied
 	// to guard against silent disk-fill (upstream issue #1310).
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// AutoRecover enables automatic LTX state recovery. When true, litestream
+	// automatically resets local tracking state on persistent LTX errors and
+	// creates a fresh snapshot, rather than requiring manual intervention.
+	// Recommended for unattended deployments.
+	// https://litestream.io/docs/troubleshooting/#option-2-automatic-recovery
+	// +kubebuilder:default=false
+	AutoRecover bool `json:"autoRecover,omitempty"`
 }
 
 // RecoveryMode controls how the operator handles pod startup when local
 // database state is missing or inconsistent with the remote archive.
-// +kubebuilder:validation:Enum=Manual;Automatic
+// +kubebuilder:validation:Enum=manual;automatic
 type RecoveryMode string
 
 const (
-	// RecoveryModeManual blocks workload startup if local state is
-	// inconsistent with the remote archive, requiring explicit LitestreamRestore.
-	RecoveryModeManual RecoveryMode = "Manual"
+	// RecoveryModeManual does not inject a restore init container.
+	// Users must use the LitestreamRestore CR for explicit recovery.
+	RecoveryModeManual RecoveryMode = "manual"
 
 	// RecoveryModeAutomatic uses upstream litestream restore flags
 	// (-if-db-not-exists, -if-replica-exists) with integrity checking.
 	// Any genuine restore failure blocks pod startup.
-	RecoveryModeAutomatic RecoveryMode = "Automatic"
+	RecoveryModeAutomatic RecoveryMode = "automatic"
 )
 
 // RecoverySpec configures how the operator handles database recovery
 // on pod startup when local state is missing or inconsistent.
 type RecoverySpec struct {
 	// Mode controls the recovery strategy.
-	// Manual (default): blocks startup if inconsistent, requiring explicit LitestreamRestore.
-	// Automatic: runs litestream restore with upstream idempotent flags and integrity check.
-	// +kubebuilder:default=Manual
+	// automatic (default): runs litestream restore with upstream idempotent flags and integrity check.
+	// manual: no restore init container; requires explicit LitestreamRestore CR.
+	// +kubebuilder:default=automatic
 	Mode RecoveryMode `json:"mode,omitempty"`
 }
 
@@ -219,11 +227,6 @@ const (
 	// without killing the sidecar process. Used by the restore controller during
 	// coordinated restores and available for manual operational use.
 	AnnotationPause = "litestream.io/pause"
-
-	// AnnotationSkipArchiveCheck, when set to "true" on a LitestreamReplica CR, disables
-	// the archive-check init container injected by the webhook. Use when
-	// intentionally starting fresh against an existing S3 backup chain.
-	AnnotationSkipArchiveCheck = "litestream.io/skip-archive-check"
 )
 
 // Condition type constants.
@@ -236,10 +239,6 @@ const (
 
 	// ConditionReplicationHealthy indicates active, healthy replication.
 	ConditionReplicationHealthy = "ReplicationHealthy"
-
-	// ConditionRecoverySafe indicates no archive mismatch detected at startup.
-	// True = safe, False = mismatch detected (blocks startup).
-	ConditionRecoverySafe = "RecoverySafe"
 
 	// ConditionBootstrapApplied indicates bootstrap SQL has been configured and
 	// the init container is ready to apply it when the database is genuinely new.

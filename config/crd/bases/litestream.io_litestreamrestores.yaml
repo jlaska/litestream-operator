@@ -224,6 +224,10 @@ spec:
                 description: ResolvedPath is the database path used for the restore,
                   resolved at reconcile time.
                 type: string
+              resolvedSubPath:
+                description: ResolvedSubPath is the volume mount subPath for the target
+                  PVC, if any.
+                type: string
               startTime:
                 description: StartTime is when the restore Job was created.
                 format: date-time
