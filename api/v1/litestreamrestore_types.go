@@ -155,6 +155,9 @@ type LitestreamRestoreStatus struct {
 	// ResolvedPath is the database path used for the restore, resolved at reconcile time.
 	ResolvedPath string `json:"resolvedPath,omitempty"`
 
+	// ResolvedSubPath is the volume mount subPath for the target PVC, if any.
+	ResolvedSubPath string `json:"resolvedSubPath,omitempty"`
+
 	// Conditions holds standard Kubernetes condition entries.
 	// +listType=map
 	// +listMapKey=type

@@ -52,10 +52,9 @@ const statusSyncInterval = 2 * time.Minute
 // Expose annotation keys as package-level aliases so tests can reference them
 // without importing the API package directly.
 const (
-	injectAnnotation      = databasev1.AnnotationInject
-	configAnnotation      = databasev1.AnnotationConfig
-	pauseAnnotation       = databasev1.AnnotationPause
-	skipArchiveAnnotation = databasev1.AnnotationSkipArchiveCheck
+	injectAnnotation = databasev1.AnnotationInject
+	configAnnotation = databasev1.AnnotationConfig
+	pauseAnnotation  = databasev1.AnnotationPause
 )
 
 const (
@@ -215,6 +214,9 @@ func buildLitestreamConfigYAML(db *databasev1.LitestreamReplica) string {
 		}
 		if db.Spec.Backup.SyncInterval != "" {
 			cfg += fmt.Sprintf("      sync-interval: %s\n", db.Spec.Backup.SyncInterval)
+		}
+		if db.Spec.Backup.AutoRecover {
+			cfg += "      auto-recover: true\n"
 		}
 	}
 
@@ -441,20 +443,6 @@ func (r *LitestreamReplicaReconciler) updateStatus(ctx context.Context, db *data
 			db.Generation, now)
 	}
 
-	// --- RecoverySafe condition (from archive-check init container status) ---
-	if archiveCheckFailed, msg := r.archiveCheckState(ctx, db, wt); archiveCheckFailed {
-		setCondition(&db.Status.Conditions, databasev1.ConditionRecoverySafe,
-			metav1.ConditionFalse, "ArchiveCheckFailed", msg,
-			db.Generation, now)
-		db.Status.Phase = databasev1.PhaseError
-		db.Status.Ready = false
-		return r.Status().Patch(ctx, db, patch)
-	} else {
-		setCondition(&db.Status.Conditions, databasev1.ConditionRecoverySafe,
-			metav1.ConditionTrue, "ArchiveCheckPassed", msg,
-			db.Generation, now)
-	}
-
 	// --- SidecarReady condition ---
 	annotated := wt.podTemplateAnnotations()[injectAnnotation] == injectEnabled
 
@@ -510,11 +498,6 @@ func (r *LitestreamReplicaReconciler) updateStatus(ctx context.Context, db *data
 			r.Recorder.Event(db, corev1.EventTypeWarning, "ReplicationUnhealthy", msg)
 		}
 
-		if healthy && db.Annotations[skipArchiveAnnotation] == injectEnabled {
-			if err := r.clearSkipArchiveCheck(ctx, db); err != nil {
-				logf.FromContext(ctx).Error(err, "failed to clear skip-archive-check annotation; will retry")
-			}
-		}
 	} else {
 		db.Status.BackupHealthy = false
 		setCondition(&db.Status.Conditions, databasev1.ConditionSidecarReady,
@@ -640,55 +623,6 @@ func (r *LitestreamReplicaReconciler) fetchLastSyncTime(ctx context.Context, pod
 		}
 	}
 	return time.Time{}, fmt.Errorf("litestream_replica_last_sync_seconds metric not found")
-}
-
-// archiveCheckState inspects pods to detect whether the archive-check init container
-// has failed. Returns (failed, message). A failure means the DB is missing but S3
-// has existing backup data — the pod is blocked until a LitestreamRestore resolves it.
-func (r *LitestreamReplicaReconciler) archiveCheckState(ctx context.Context, db *databasev1.LitestreamReplica, wt *workloadTarget) (bool, string) {
-	if !db.Spec.Backup.Enabled {
-		return false, "backup not enabled"
-	}
-
-	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList,
-		client.InNamespace(db.Namespace),
-		client.MatchingLabels(wt.selectorLabels()),
-	); err != nil {
-		return false, fmt.Sprintf("failed to list pods: %v", err)
-	}
-
-	const archiveCheckContainer = "litestream-archive-check"
-	for i := range podList.Items {
-		pod := &podList.Items[i]
-		for _, cs := range pod.Status.InitContainerStatuses {
-			if cs.Name != archiveCheckContainer {
-				continue
-			}
-			if cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
-				return true, fmt.Sprintf(
-					"archive check failed in pod %s: S3 has existing backup data but local database is missing; create a LitestreamRestore CR to recover",
-					pod.Name,
-				)
-			}
-		}
-	}
-	return false, "archive check passed"
-}
-
-// clearSkipArchiveCheck removes the skip-archive-check annotation from the LitestreamReplica.
-// It re-fetches the object to avoid version conflicts before patching.
-func (r *LitestreamReplicaReconciler) clearSkipArchiveCheck(ctx context.Context, db *databasev1.LitestreamReplica) error {
-	latest := &databasev1.LitestreamReplica{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: db.Namespace, Name: db.Name}, latest); err != nil {
-		return err
-	}
-	if latest.Annotations[skipArchiveAnnotation] != injectEnabled {
-		return nil
-	}
-	patch := client.MergeFrom(latest.DeepCopy())
-	delete(latest.Annotations, skipArchiveAnnotation)
-	return r.Patch(ctx, latest, patch)
 }
 
 // handleReplicaFinalization cleans up operator-owned annotations from the target

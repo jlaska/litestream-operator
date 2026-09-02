@@ -126,14 +126,6 @@ func validateLitestreamReplica(ctx context.Context, c client.Client, db *databas
 		}
 	}
 
-	// Warn when Automatic recovery is enabled — known upstream corruption risk.
-	if db.Spec.Recovery.Mode == databasev1.RecoveryModeAutomatic {
-		warnings = append(warnings,
-			"recovery.mode: Automatic carries a known restore-corruption risk (Litestream upstream #1164/#1220). "+
-				"The integrity gate (PRAGMA quick_check) will catch corruption before the app starts, "+
-				"but consider using a LitestreamRestore CR for controlled, auditable recovery instead.")
-	}
-
 	// Optional workload checks: requires a live API client and a resolvable workload.
 	// Skip the check when the client is nil (unit tests) or the workload is not yet created.
 	if c != nil && !bothSet && !neitherSet {

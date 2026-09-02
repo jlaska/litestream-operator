@@ -8,6 +8,7 @@ This guide covers day-to-day use of the Litestream Operator for SQLite backup an
 - [Disaster Recovery](#disaster-recovery)
 - [Point-in-Time Restore](#point-in-time-restore)
 - [Restore Without Downtime](#restore-without-downtime)
+- [Auto-Recover for LTX Corruption](#auto-recover-for-ltx-corruption)
 - [Bootstrap SQL](#bootstrap-sql)
 - [Multi-Container Deployments](#multi-container-deployments)
 - [Operational Annotations](#operational-annotations)
@@ -15,88 +16,84 @@ This guide covers day-to-day use of the Litestream Operator for SQLite backup an
 
 ## Recovery Modes
 
-The operator supports two recovery modes that control pod startup behavior when the local database is missing or inconsistent with the remote S3 archive.
+The operator supports two recovery modes that control pod startup behavior when the local database is missing.
 
-### Manual (default)
+### automatic (default)
 
-Manual mode blocks startup and requires an explicit `LitestreamRestore` to recover. This is the safest option for production.
+Automatic mode uses upstream Litestream's native restore flags with integrity checking. This matches the [upstream recommended deployment pattern](https://litestream.io/reference/restore/#idempotent-deployment-script).
 
 ```yaml
 spec:
   recovery:
-    mode: Manual
+    mode: automatic
 ```
 
 **Startup behavior:**
 
 | Local DB | Remote Archive | Result |
 |---|---|---|
-| Exists, trusted | Any | Allow startup |
+| Exists | Any | Skip restore (normal restart) |
+| Missing | Exists | **Restore from S3** with integrity check |
 | Missing | Missing | Allow startup (genuinely new database) |
-| Missing | Exists | **Block startup** — archive available, explicit restore required |
-| Exists, untracked | Exists | **Block startup** — possible recreated-database-without-restore |
 
-When startup is blocked, the `RecoverySafe` condition becomes `False` with a message explaining why. Create a `LitestreamRestore` with `mode: InPlace` to recover.
+Any genuine restore failure (bad credentials, network, corruption) fails the init container and **prevents application startup**. The operator never converts a restore error into a fresh database.
 
-### Automatic
+**Recovery procedure** (data loss or PVC wipe):
 
-Automatic mode uses upstream Litestream's native restore flags:
+1. Scale the workload to 0
+2. Delete the database file from the PVC (or let the PVC be recreated)
+3. Scale the workload to 1
+4. The auto-restore init container detects the missing DB and restores from S3
 
-```bash
-litestream restore \
-  -if-db-not-exists \
-  -if-replica-exists \
-  -integrity-check quick \
-  -config /etc/litestream/litestream.yml \
-  /path/database.sqlite
-```
+### manual
+
+Manual mode does not inject a restore init container. Recovery requires creating an explicit `LitestreamRestore` CR.
 
 ```yaml
 spec:
   recovery:
-    mode: Automatic
+    mode: manual
 ```
 
-Any genuine restore failure fails the init container and **prevents application startup**. The operator never converts a restore error into a fresh database.
+Use this when you want full control over when restores happen.
 
 ## Disaster Recovery
 
 ### Scenario: PVC lost, remote archive intact
 
-**With Automatic recovery mode:**
+With the default `automatic` recovery mode, the pod's init container automatically
+restores from the S3 archive on next startup. No manual intervention required —
+the database is restored, integrity-checked, and the application starts.
 
-The pod's init container automatically restores from the S3 archive on next startup. No manual intervention required — the database is restored, integrity-checked, and the application starts.
+### Scenario: Explicit restore needed
 
-**With Manual recovery mode (default):**
+Create an InPlace restore:
 
-1. The pod starts but blocks — `RecoverySafe=False` because no local DB exists but the archive is available.
+```yaml
+apiVersion: litestream.io/v1
+kind: LitestreamRestore
+metadata:
+  name: recover-db
+  namespace: my-app
+spec:
+  sourceRef:
+    name: my-app-db
+  mode: InPlace
+```
 
-2. Create an InPlace restore:
+The restore controller:
 
-   ```yaml
-   apiVersion: litestream.io/v1
-   kind: LitestreamRestore
-   metadata:
-     name: recover-db
-     namespace: my-app
-   spec:
-     sourceRef:
-       name: my-app-db
-     mode: InPlace
-   ```
+- Acquires a concurrency lock (one active InPlace restore per source)
+- Fences the application (scales workload to zero, pauses replication)
+- Runs the restore Job
+- Validates integrity
+- Resumes the application
 
-3. The restore controller:
-   - Acquires a concurrency lock (one active InPlace restore per source)
-   - Fences the application (scales workload to zero, pauses replication)
-   - Runs the restore Job
-   - Validates integrity
-   - Resumes the application
+Monitor progress:
 
-4. Monitor progress:
-
-   ```bash
-   kubectl get litestreamrestore recover-db -n my-app -w
-   ```
+```bash
+kubectl get litestreamrestore recover-db -n my-app -w
+```
 
 ### Restore failure safety
 
@@ -157,6 +154,25 @@ Use cases:
 
 The target PVC must already exist. The operator does not create PVCs.
 
+## Auto-Recover for LTX Corruption
+
+When Litestream encounters persistent LTX (transaction log) errors during synchronization, the `autoRecover` option enables automatic state recovery without manual intervention.
+
+```yaml
+spec:
+  backup:
+    enabled: true
+    autoRecover: true
+```
+
+When enabled, Litestream automatically resets local tracking state on persistent LTX errors and creates a fresh snapshot. This is the upstream-recommended approach for [unattended deployments](https://litestream.io/docs/troubleshooting/#option-2-automatic-recovery).
+
+**Without auto-recover**, LTX corruption requires manual intervention:
+
+1. Scale the workload to 0
+2. Delete the litestream state directory (e.g., `.app.db-litestream/`) from the PVC — leave the DB file intact
+3. Scale the workload to 1 — the sidecar creates a fresh snapshot on startup
+
 ## Bootstrap SQL
 
 Bootstrap SQL seeds the database schema when a genuinely new database is created — no local database file AND no remote archive.
@@ -210,38 +226,7 @@ Remove to resume:
 kubectl annotate litestreamreplica my-app-db litestream.io/pause- -n my-app
 ```
 
-### Skip archive check
-
-The archive-check init container is **automatically skipped** after an InPlace
-`LitestreamRestore` completes — the restore controller sets the annotation and
-the webhook also checks for a recently completed restore as a fallback. No
-manual intervention is needed for the normal restore flow.
-
-For manual bypass (e.g., intentionally starting fresh against an existing S3
-backup chain), set the annotation on the LitestreamReplica CR:
-
-```bash
-kubectl annotate litestreamreplica my-app-db litestream.io/skip-archive-check=true -n my-app
-```
-
-The annotation is automatically cleared once the Litestream sidecar is healthy.
-
 ## Troubleshooting
-
-### Pod stuck in Init (Manual recovery mode)
-
-**Symptom**: Pod is stuck with init containers not completing.
-
-**Diagnosis**:
-
-```bash
-kubectl describe litestreamreplica my-app-db -n my-app
-# Look for RecoverySafe=False condition
-```
-
-**Cause**: Local database is missing but a remote archive exists. Manual mode requires explicit recovery.
-
-**Fix**: Create a `LitestreamRestore` with `mode: InPlace`.
 
 ### UnsafeRolloutStrategy condition
 

@@ -66,8 +66,8 @@ S3_ACCESS_KEY=... S3_SECRET_KEY=... \
 **Important:** When using an external S3 backend, data persists across test runs
 (unlike in-cluster MinIO, which is destroyed with the Kind cluster). Each test's
 `BeforeAll` calls `mcCleanPath(dbName)` to remove stale backup data from prior
-runs. Without this cleanup, the archive-check init container detects existing S3
-backup data alongside a missing local DB and blocks pod startup.
+runs. Without this cleanup, the auto-restore init container may restore stale
+data from a prior test run instead of starting fresh.
 
 **Running a single test:**
 
@@ -76,7 +76,7 @@ backup data alongside a missing local DB and blocks pod startup.
 KUBECONFIG=/tmp/litestream-integration-kubeconfig \
 S3_ENDPOINT=... S3_ACCESS_KEY=... S3_SECRET_KEY=... \
   go test ./test/integration/... -v -timeout 20m -count=1 \
-  -ginkgo.focus="Archive Check"
+  -ginkgo.focus="Auto-Restore on Startup"
 ```
 
 ## Container Image

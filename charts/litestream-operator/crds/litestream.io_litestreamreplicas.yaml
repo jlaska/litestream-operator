@@ -61,6 +61,15 @@ spec:
               backup:
                 description: Backup defines the Litestream replication / backup configuration.
                 properties:
+                  autoRecover:
+                    default: false
+                    description: |-
+                      AutoRecover enables automatic LTX state recovery. When true, litestream
+                      automatically resets local tracking state on persistent LTX errors and
+                      creates a fresh snapshot, rather than requiring manual intervention.
+                      Recommended for unattended deployments.
+                      https://litestream.io/docs/troubleshooting/#option-2-automatic-recovery
+                    type: boolean
                   destination:
                     description: Destination specifies where backups are stored.
                     properties:
@@ -254,14 +263,14 @@ spec:
                   is missing or inconsistent with the remote archive.
                 properties:
                   mode:
-                    default: Manual
+                    default: automatic
                     description: |-
                       Mode controls the recovery strategy.
-                      Manual (default): blocks startup if inconsistent, requiring explicit LitestreamRestore.
-                      Automatic: runs litestream restore with upstream idempotent flags and integrity check.
+                      automatic (default): runs litestream restore with upstream idempotent flags and integrity check.
+                      manual: no restore init container; requires explicit LitestreamRestore CR.
                     enum:
-                    - Manual
-                    - Automatic
+                    - manual
+                    - automatic
                     type: string
                 type: object
               runAsGroup:

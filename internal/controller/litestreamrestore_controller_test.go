@@ -231,12 +231,12 @@ var _ = Describe("LitestreamRestore Controller", func() {
 		Expect(container.Name).To(Equal("litestream-restore"))
 		Expect(container.Image).To(ContainSubstring("litestream"))
 
-		// Should use -config flag (endpoint comes from config file, not env var).
-		Expect(container.Args).To(ContainElement("-config"))
-		Expect(container.Args).To(ContainElement("/etc/litestream/litestream.yml"))
-		// Should include -o <targetPath> and the db path from the source LitestreamReplica spec.
-		Expect(container.Args).To(ContainElement("-o"))
-		Expect(container.Args).To(ContainElement(targetPath))
+		// The restore command is wrapped in a shell script for logging and cleanup.
+		Expect(container.Command).To(Equal([]string{"sh", "-c", container.Command[2]}))
+		script := container.Command[2]
+		Expect(script).To(ContainSubstring("-config /etc/litestream/litestream.yml"))
+		Expect(script).To(ContainSubstring("-o"))
+		Expect(script).To(ContainSubstring(targetPath))
 
 		// Should inject S3 credential env vars from the secret.
 		envNames := make([]string, len(container.Env))
@@ -330,8 +330,9 @@ var _ = Describe("LitestreamRestore Controller", func() {
 			Namespace: namespaceName,
 		}, job)).To(Succeed())
 
-		args := job.Spec.Template.Spec.Containers[0].Args
-		Expect(args).To(ContainElements("-timestamp", "2026-06-17T10:00:00Z"))
+		script := job.Spec.Template.Spec.Containers[0].Command[2]
+		Expect(script).To(ContainSubstring("-timestamp"))
+		Expect(script).To(ContainSubstring("2026-06-17T10:00:00Z"))
 	})
 
 	It("sets status to Restoring after creating the Job", func() {
@@ -845,27 +846,6 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		db := &databasev1.LitestreamReplica{}
 		Expect(k8sClient.Get(ctx, dbKey, db)).To(Succeed())
 		Expect(db.Annotations[databasev1.AnnotationPause]).NotTo(Equal("true"))
-	})
-
-	It("sets skip-archive-check annotation on LitestreamReplica after successful restore", func() {
-		dbKey, restoreKey, deployKey := newStateMachineResources("skip-archive-check-set", 1)
-		defer cleanupResources(dbKey, restoreKey, deployKey)
-
-		reconciler := newReconciler()
-		driveToResuming(ctx, reconciler, dbKey, restoreKey, deployKey)
-
-		// Resuming reconcile removes the pause annotation, then waits for the
-		// ConfigMap to reflect the unpaused config before setting skip-archive-check.
-		// Retry until the background LitestreamReplica controller updates the ConfigMap.
-		Eventually(func(g Gomega) {
-			_, reconcileErr := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: restoreKey})
-			g.Expect(reconcileErr).NotTo(HaveOccurred())
-
-			db := &databasev1.LitestreamReplica{}
-			g.Expect(k8sClient.Get(ctx, dbKey, db)).To(Succeed())
-			g.Expect(db.Annotations[databasev1.AnnotationSkipArchiveCheck]).To(Equal("true"),
-				"restore controller must set skip-archive-check to prevent false-positive archive-check on next pod start")
-		}, 10*time.Second, 100*time.Millisecond).Should(Succeed())
 	})
 
 	It("leaves workload fenced on Job failure and removes pause annotation", func() {
@@ -1605,14 +1585,14 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 		})
 
 		It("buildRestoreJob has no SecurityContext when RunAsUser/RunAsGroup omitted", func() {
-			job := reconciler.buildRestoreJob(restore, sourceDB, "restore-job", "test-pvc", "/data/app.db")
+			job := reconciler.buildRestoreJob(restore, sourceDB, "restore-job", "test-pvc", "/data/app.db", "")
 			Expect(job.Spec.Template.Spec.SecurityContext).To(BeNil())
 		})
 
 		It("buildRestoreJob sets PodSecurityContext when RunAsUser is set", func() {
 			uid := int64(1000)
 			restore.Spec.RunAsUser = &uid
-			job := reconciler.buildRestoreJob(restore, sourceDB, "restore-job", "test-pvc", "/data/app.db")
+			job := reconciler.buildRestoreJob(restore, sourceDB, "restore-job", "test-pvc", "/data/app.db", "")
 			Expect(job.Spec.Template.Spec.SecurityContext).NotTo(BeNil())
 			Expect(job.Spec.Template.Spec.SecurityContext.RunAsUser).NotTo(BeNil())
 			Expect(*job.Spec.Template.Spec.SecurityContext.RunAsUser).To(Equal(int64(1000)))
@@ -1623,7 +1603,7 @@ var _ = Describe("LitestreamRestore State Machine", func() {
 			uid, gid := int64(1000), int64(2000)
 			restore.Spec.RunAsUser = &uid
 			restore.Spec.RunAsGroup = &gid
-			job := reconciler.buildRestoreJob(restore, sourceDB, "restore-job", "test-pvc", "/data/app.db")
+			job := reconciler.buildRestoreJob(restore, sourceDB, "restore-job", "test-pvc", "/data/app.db", "")
 			secCtx := job.Spec.Template.Spec.SecurityContext
 			Expect(secCtx).NotTo(BeNil())
 			Expect(*secCtx.RunAsUser).To(Equal(int64(1000)))

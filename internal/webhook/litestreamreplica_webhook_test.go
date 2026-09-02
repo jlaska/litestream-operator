@@ -109,12 +109,6 @@ var _ = Describe("LitestreamReplicaValidator", func() {
 				errContains: "targetStatefulSet",
 			},
 			{
-				description:    "valid: recovery.mode=Automatic yields a warning but no error",
-				mutate:         func(db *databasev1.LitestreamReplica) { db.Spec.Recovery.Mode = databasev1.RecoveryModeAutomatic },
-				expectError:    false,
-				expectWarnings: true,
-			},
-			{
 				description: "invalid: missing databaseName",
 				mutate:      func(db *databasev1.LitestreamReplica) { db.Spec.DatabaseName = "" },
 				expectError: true,
