@@ -2,7 +2,7 @@
 # This file defines version variables used across the project
 
 # Semantic version (update this for releases)
-VERSION ?= v0.4.2
+VERSION ?= v0.4.3
 
 # Container image settings
 REGISTRY ?= ghcr.io
