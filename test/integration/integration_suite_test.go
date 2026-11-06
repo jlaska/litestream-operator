@@ -37,13 +37,13 @@ const (
 )
 
 var (
-	useExternalS3 bool
-	s3AccessKey   string
-	s3SecretKey   string
-	s3Bucket      string
-	s3Endpoint    string // what Litestream pods use (in-cluster DNS or external hostname)
-	s3Region      string // S3 signing region (e.g. "garage" for Garage)
-	mcEndpoint    string // scheme-qualified URL for configuring the mc alias
+	useExternalS3    bool
+	s3AccessKey      string
+	s3SecretKey      string
+	s3Bucket         string
+	s3Endpoint       string // what Litestream pods use (in-cluster DNS or external hostname)
+	s3Region         string // S3 signing region (e.g. "garage" for Garage)
+	s3ClientEndpoint string // scheme-qualified URL used by the aws-cli s3-client pod
 )
 
 func TestIntegration(t *testing.T) {
@@ -69,10 +69,10 @@ var _ = BeforeSuite(func() {
 		}
 
 		if strings.HasPrefix(ep, "https://") || strings.HasPrefix(ep, "http://") {
-			mcEndpoint = ep
+			s3ClientEndpoint = ep
 			s3Endpoint = ep
 		} else {
-			mcEndpoint = "http://" + ep
+			s3ClientEndpoint = "http://" + ep
 			s3Endpoint = ep
 		}
 		s3Region = os.Getenv("S3_REGION")
@@ -81,7 +81,7 @@ var _ = BeforeSuite(func() {
 		s3Bucket = defaultBucket
 		s3Endpoint = "garage." + testNamespace + ".svc.cluster.local:3900"
 		s3Region = "garage"
-		mcEndpoint = "http://garage:3900"
+		s3ClientEndpoint = "http://garage:3900"
 		_, _ = fmt.Fprintf(GinkgoWriter, "Using in-cluster Garage (bucket: %s)\n", s3Bucket)
 	}
 
@@ -144,12 +144,13 @@ var _ = BeforeSuite(func() {
 	)
 
 	By("starting persistent S3 client pod")
-	applyLiteral(s3ClientPodManifest())
+	applyLiteral(s3ClientPodManifest(s3ClientEndpoint, s3Region))
 	kubectl("wait", "-n", testNamespace, "pod/s3-client",
 		"--for=condition=Ready", "--timeout=2m")
 	kubectl("exec", "-n", testNamespace, "s3-client", "--",
 		"/bin/sh", "-c",
-		fmt.Sprintf("mc alias set local %s %s %s > /dev/null 2>&1", mcEndpoint, s3AccessKey, s3SecretKey),
+		// Garage requires path-style addressing; endpoint and credentials come from the pod env.
+		"mkdir -p ~/.aws && printf '[default]\\ns3 =\\n  addressing_style = path\\n' > ~/.aws/config",
 	)
 })
 
@@ -327,7 +328,11 @@ spec:
 `, testNamespace, strings.Repeat("ab", 32))
 }
 
-func s3ClientPodManifest() string {
+// s3ClientPodManifest returns a long-running aws-cli pod configured via environment
+// variables, with credentials read from the s3-creds Secret. Checksums are only
+// computed/validated when required, since the newer aws-cli defaults are not
+// supported by S3-compatible stores such as Garage.
+func s3ClientPodManifest(endpoint, region string) string {
 	return fmt.Sprintf(`
 apiVersion: v1
 kind: Pod
@@ -337,8 +342,27 @@ metadata:
 spec:
   restartPolicy: Never
   containers:
-    - name: mc
-      image: quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z
+    - name: aws-cli
+      image: amazon/aws-cli:2.39.5
       command: ["sleep", "infinity"]
-`, testNamespace)
+      env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: s3-creds
+              key: ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: s3-creds
+              key: SECRET_ACCESS_KEY
+        - name: AWS_DEFAULT_REGION
+          value: %q
+        - name: AWS_ENDPOINT_URL
+          value: %q
+        - name: AWS_REQUEST_CHECKSUM_CALCULATION
+          value: when_required
+        - name: AWS_RESPONSE_CHECKSUM_VALIDATION
+          value: when_required
+`, testNamespace, region, endpoint)
 }

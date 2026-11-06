@@ -171,7 +171,7 @@ var _ = Describe("Integration", Ordered, func() {
 				if out == "" {
 					// Fall back: check the whole bucket so a path mismatch surfaces immediately.
 					all, _ := kubectlQ("exec", "-n", testNamespace, "s3-client", "--",
-						"/bin/sh", "-c", "mc ls --recursive local/"+s3Bucket+"/")
+						"/bin/sh", "-c", "aws s3 ls --recursive s3://"+s3Bucket+"/")
 					g.Expect(out).NotTo(BeEmpty(),
 						"expected backup objects at %s/%s/ — full bucket contents:\n%s",
 						s3Bucket, dbName, all)
@@ -559,7 +559,7 @@ var _ = Describe("Auto-Restore on Startup", Ordered, func() {
 			out := s3List(s3Bucket + "/" + dbName + "/")
 			if out == "" {
 				all, _ := kubectlQ("exec", "-n", testNamespace, "s3-client", "--",
-					"/bin/sh", "-c", "mc ls --recursive local/"+s3Bucket+"/")
+					"/bin/sh", "-c", "aws s3 ls --recursive s3://"+s3Bucket+"/")
 				g.Expect(out).NotTo(BeEmpty(),
 					"expected backup objects at %s/%s/ — full bucket contents:\n%s",
 					s3Bucket, dbName, all)
@@ -1879,13 +1879,13 @@ func runningPod(deploymentName string) string {
 	return podName
 }
 
-// s3List runs `mc ls` against the S3 service using the persistent s3-client pod.
+// s3List runs `aws s3 ls` against the S3 service using the persistent s3-client pod.
 // Returns the listing output on success, empty string on any error.
-// The mc alias is pre-configured in BeforeSuite so no setup is needed here.
+// Endpoint and credentials are configured in the pod env, so no setup is needed here.
 func s3List(path string) string {
 	out, err := kubectlQ("exec", "-n", testNamespace, "s3-client", "--",
 		"/bin/sh", "-c",
-		fmt.Sprintf("mc ls local/%s", path),
+		fmt.Sprintf("aws s3 ls s3://%s", path),
 	)
 	if err != nil {
 		return ""
@@ -1898,12 +1898,12 @@ func s3List(path string) string {
 func s3CleanPath(pathPrefix string) {
 	_, _ = kubectlQ("exec", "-n", testNamespace, "s3-client", "--",
 		"/bin/sh", "-c",
-		fmt.Sprintf("mc rm --recursive --force local/%s/%s/ 2>/dev/null || true", s3Bucket, pathPrefix),
+		fmt.Sprintf("aws s3 rm --recursive s3://%s/%s/ 2>/dev/null || true", s3Bucket, pathPrefix),
 	)
 }
 
 // dumpReplicationDiagnostics prints a diagnostic snapshot to help debug Litestream
-// replication failures. Call via DeferCleanup before polling mc ls so the output
+// replication failures. Call via DeferCleanup before polling aws s3 ls so the output
 // appears after any failure, regardless of which check timed out.
 // dbName is the LitestreamReplica CR name (used for ConfigMap lookup: <dbName>-litestream).
 // dbFile is the database filename (used for sqlite3 access: /data/<dbFile>).
@@ -1951,13 +1951,13 @@ func dumpReplicationDiagnostics(appName, dbName, dbFile string) {
 
 	// 3. Full bucket listing (recursive, entire bucket).
 	allObjects, _ := kubectlQ("exec", "-n", testNamespace, "s3-client", "--",
-		"/bin/sh", "-c", "mc ls --recursive local/"+s3Bucket+"/")
-	GinkgoWriter.Printf("--- mc ls --recursive local/%s/ ---\n%s\n", s3Bucket, allObjects)
+		"/bin/sh", "-c", "aws s3 ls --recursive s3://"+s3Bucket+"/")
+	GinkgoWriter.Printf("--- aws s3 ls --recursive s3://%s/ ---\n%s\n", s3Bucket, allObjects)
 
-	// 4. mc alias verification.
+	// 4. aws-cli configuration verification.
 	aliasList, _ := kubectlQ("exec", "-n", testNamespace, "s3-client", "--",
-		"/bin/sh", "-c", "mc alias list local")
-	GinkgoWriter.Printf("--- mc alias list local ---\n%s\n", aliasList)
+		"/bin/sh", "-c", "aws configure list")
+	GinkgoWriter.Printf("--- aws configure list ---\n%s\n", aliasList)
 
 	// 5. Pod container statuses (detect CrashLoopBackOff etc.).
 	podStatus, _ := kubectlQ("get", "pods", "-n", testNamespace, "-l", "app="+appName, "-o", "wide")
