@@ -31,7 +31,7 @@ jobs:
           make test
 
       - name: Check coverage thresholds
-        uses: vladopajic/go-test-coverage@v2
+        uses: vladopajic/go-test-coverage@v2.23.0
         with:
           config: ./.testcoverage.yml
 
@@ -62,7 +62,7 @@ jobs:
         run: make test
 
       - name: Generate and push badge
-        uses: vladopajic/go-test-coverage@v2
+        uses: vladopajic/go-test-coverage@v2.23.0
         with:
           config: ./.testcoverage.yml
           git-token: ${{ github.token }}
