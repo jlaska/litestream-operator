@@ -5,6 +5,3 @@ threshold:
   total: 80
   # Require at least 70% per package
   file: 70
-
-badge:
-  file-name: .badges/main/coverage.svg
