@@ -313,6 +313,9 @@ clean: ## Remove build artifacts: manager binary, coverage report, and release p
 clean-tools: ## Remove downloaded tool binaries (controller-gen, kustomize, setup-envtest, golangci-lint).
 	rm -rf bin/
 
+.PHONY: distclean
+distclean: clean clean-tools ## Remove build artifacts and downloaded tools (run `make deps` to reinstall).
+
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
@@ -491,6 +494,9 @@ $(ENVTEST): $(LOCALBIN)
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+
+.PHONY: deps
+deps: kustomize controller-gen setup-envtest golangci-lint ## Download all development tools and envtest binaries into bin/.
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary
