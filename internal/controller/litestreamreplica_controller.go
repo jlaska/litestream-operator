@@ -104,7 +104,7 @@ func (r *LitestreamReplicaReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		if err := r.Update(ctx, db); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	target := db.Spec.TargetDeployment
