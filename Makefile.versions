@@ -19,10 +19,7 @@ GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 CGO_ENABLED ?= 0
 
-# Tools versions
-CONTROLLER_TOOLS_VERSION ?= v0.18.0
-KUSTOMIZE_VERSION ?= v5.0.1
-ENVTEST_K8S_VERSION ?= 1.33.0
+# Tool versions are defined in the Makefile's "Dependencies" section.
 
 .PHONY: version
 version: ## Display version information
