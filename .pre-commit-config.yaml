@@ -1,3 +1,8 @@
+# Pin Node so nodeenv does not resolve "latest" (currently a v27 alpha, which
+# nodeenv fails to parse). Only affects node-based hooks (markdownlint).
+default_language_version:
+  node: 24.22.3
+
 repos:
   # Standard file hygiene
   - repo: https://github.com/pre-commit/pre-commit-hooks
