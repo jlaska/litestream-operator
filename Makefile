@@ -168,6 +168,20 @@ else ifneq ($(_PODMAN_DETECTED),0)
 _KIND_PROVIDER_ENV = KIND_EXPERIMENTAL_PROVIDER=podman
 endif
 
+# Platform of the Kind node images. With Docker 29's containerd image store, a
+# pulled multi-arch image keeps its full index but only this platform's blobs, so
+# `kind load docker-image` fails in `ctr import --all-platforms` ("content digest
+# ... not found"). Pull and save a single platform, then load the archive.
+# `podman save` has no --platform flag (and already saves one platform), so the
+# flag is only passed when the container tool supports it.
+KIND_PLATFORM ?= linux/$(shell go env GOARCH)
+_SAVE_PLATFORM_FLAG = $(shell $(CONTAINER_TOOL) save --help 2>&1 | grep -q -- --platform && echo --platform $(KIND_PLATFORM))
+# Shell snippet: load the pulled image $(1) into the integration Kind cluster.
+kind-load-pulled = tmp=$$(mktemp) && \
+	$(CONTAINER_TOOL) save $(_SAVE_PLATFORM_FLAG) -o $$tmp $(1) && \
+	$(_KIND_PROVIDER_ENV) $(KIND) load image-archive $$tmp --name $(INTEGRATION_KIND_CLUSTER); \
+	rc=$$?; rm -f $$tmp; [ $$rc -eq 0 ]
+
 .PHONY: test-integration-setup
 test-integration-setup: docker-build ## Create Kind cluster (with Podman support) and install prerequisites
 	@command -v $(KIND) >/dev/null 2>&1 || { echo "Error: kind not found"; exit 1; }
@@ -197,13 +211,13 @@ test-integration-setup: docker-build ## Create Kind cluster (with Podman support
 	  keinos/sqlite3:latest \
 	  amazon/aws-cli:2.39.5; do \
 	    echo "    pulling $$img"; \
-	    $(CONTAINER_TOOL) pull $$img; \
-	    $(_KIND_PROVIDER_ENV) $(KIND) load docker-image $$img --name $(INTEGRATION_KIND_CLUSTER); \
+	    $(CONTAINER_TOOL) pull --platform $(KIND_PLATFORM) $$img; \
+	    $(call kind-load-pulled,$$img) || exit 1; \
 	done
 	@if [ -z "$(S3_ENDPOINT)" ]; then \
 	    echo "    pulling dxflrs/garage:v1.1.0"; \
-	    $(CONTAINER_TOOL) pull dxflrs/garage:v1.1.0; \
-	    $(_KIND_PROVIDER_ENV) $(KIND) load docker-image dxflrs/garage:v1.1.0 --name $(INTEGRATION_KIND_CLUSTER); \
+	    $(CONTAINER_TOOL) pull --platform $(KIND_PLATFORM) dxflrs/garage:v1.1.0; \
+	    $(call kind-load-pulled,dxflrs/garage:v1.1.0) || exit 1; \
 	else \
 	    echo "    (skipping Garage image — using external S3)"; \
 	fi
@@ -245,13 +259,13 @@ test-integration-redeploy: docker-build ## Rebuild image, reload into existing c
 	  keinos/sqlite3:latest \
 	  amazon/aws-cli:2.39.5; do \
 	    echo "    $$img"; \
-	    $(CONTAINER_TOOL) pull $$img 2>/dev/null || true; \
-	    $(_KIND_PROVIDER_ENV) $(KIND) load docker-image $$img --name $(INTEGRATION_KIND_CLUSTER); \
+	    $(CONTAINER_TOOL) pull --platform $(KIND_PLATFORM) $$img 2>/dev/null || true; \
+	    $(call kind-load-pulled,$$img) || exit 1; \
 	done
 	@if [ -z "$(S3_ENDPOINT)" ]; then \
 	    echo "    dxflrs/garage:v1.1.0"; \
-	    $(CONTAINER_TOOL) pull dxflrs/garage:v1.1.0 2>/dev/null || true; \
-	    $(_KIND_PROVIDER_ENV) $(KIND) load docker-image dxflrs/garage:v1.1.0 --name $(INTEGRATION_KIND_CLUSTER); \
+	    $(CONTAINER_TOOL) pull --platform $(KIND_PLATFORM) dxflrs/garage:v1.1.0 2>/dev/null || true; \
+	    $(call kind-load-pulled,dxflrs/garage:v1.1.0) || exit 1; \
 	fi
 	@echo "==> Restarting operator"
 	KUBECONFIG=$(INTEGRATION_KUBECONFIG) kubectl rollout restart \
